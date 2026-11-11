@@ -104,7 +104,7 @@ jobs:
         with:
           name: ${{ env.ARTIFACT }}
           path: data/parking.db.gz
-          retention-days: 7
+          retention-days: 3   # only the newest is used; short retention keeps old copies from piling up
           compression-level: 0
           if-no-files-found: error
 

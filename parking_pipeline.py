@@ -407,8 +407,11 @@ def cmd_fetch(args):
     ocr_futures = {}
     t0, counts = time.monotonic(), {}
 
-    def drain_ocr(block):
-        done = [f for f in ocr_futures if f.done()] if not block else list(as_completed(ocr_futures))
+    def drain_ocr(block, timeout=None):
+        if block:
+            done, _ = wait(ocr_futures, timeout=timeout)  # ALL_COMPLETED, or whatever finished by the timeout
+        else:
+            done = [f for f in ocr_futures if f.done()]
         for f in done:
             cn, path = ocr_futures.pop(f)
             try:
@@ -440,14 +443,21 @@ def cmd_fetch(args):
             if ocr_pool and res["status"] == "fetched":
                 ocr_futures[ocr_pool.submit(ocr_image, tess, res["image_path"])] = (cn, res["image_path"])
                 drain_ocr(block=False)
+                # Backpressure: if OCR is slower than downloading on this machine, pause fetching rather than
+                # let a backlog build that would take too long to clear before a CI time limit.
+                while len(ocr_futures) > args.ocr_workers * 25:
+                    wait(ocr_futures, return_when=FIRST_COMPLETED)
+                    drain_ocr(block=False)
             rate = i / (time.monotonic() - t0) * 3600
             print(f"[{i}/{len(rows)}] {cn}: {res['msg']}  ({rate:.0f}/hour)",
                   file=sys.stderr if res["status"] == "error" else sys.stdout)
             if i % 100 == 0:
                 print(f"  -- {c.stats()}" + (f", {len(ocr_futures)} waiting for OCR" if ocr_pool else ""))
     if ocr_pool:
-        drain_ocr(block=True)
-        ocr_pool.shutdown()
+        # finish the (bounded) OCR backlog; with a deadline, give up after 15 minutes so the caller can
+        # still save state. Anything unfinished stays 'fetched' and is redone next run.
+        drain_ocr(block=True, timeout=15 * 60 if args.stop_at else None)
+        ocr_pool.shutdown(wait=False, cancel_futures=True)
     if past_deadline(args):
         print("stopped at --stop-at deadline; rerun to continue")
     print(f"done in {time.monotonic() - t0:.0f}s: {counts} ({c.stats()})")

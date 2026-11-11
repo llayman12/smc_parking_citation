@@ -120,13 +120,15 @@ jobs:
 
       - name: Get the index and any partial work on this bucket
         run: |
-          gh run download "${{ needs.plan.outputs.index_run }}" -n index -D index -R "$GITHUB_REPOSITORY"
+          # GitHub's artifact service has had stretches of HTTP 502s (2026-11-11): retry before giving up
+          retry() { for wait in 0 30 90 180 300; do sleep $wait; "$@" && return 0; echo "retrying: $*"; done; return 1; }
+          retry gh run download "${{ needs.plan.outputs.index_run }}" -n index -D index -R "$GITHUB_REPOSITORY"
           gunzip index/parking.db.gz
           mkdir -p data
           part_run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=part-$NNN&per_page=1" \
                      -q '.artifacts[] | select(.expired == false) | .workflow_run.id')
           if [ -n "$part_run" ]; then
-            gh run download "$part_run" -n "part-$NNN" -D data -R "$GITHUB_REPOSITORY"
+            retry gh run download "$part_run" -n "part-$NNN" -D data -R "$GITHUB_REPOSITORY"
             gunzip -f data/parking.db.gz
             echo "resuming bucket $NNN from run $part_run"
           fi

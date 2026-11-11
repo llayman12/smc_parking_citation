@@ -28,16 +28,28 @@ $imgOut = Join-Path $OneDriveDir "images"
 New-Item -ItemType Directory -Force $buckets, $dbOut, $imgOut | Out-Null
 
 function Get-Artifact([long]$id, [string]$dest) {
-    # curl streams the zip straight to disk; written to a temp name first so a half-download is never kept
+    # curl streams the zip straight to disk; written to a temp name first so a half-download is never kept.
+    # GitHub's artifact service sometimes answers 502 for a while (seen 2026-11-11): retry with backoff,
+    # and return $false instead of stopping the whole sync, so the next run picks the artifact up.
     $token = gh auth token
-    & curl.exe -sS -L --fail -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" `
-        -o "$dest.partial" "https://api.github.com/repos/$Repo/actions/artifacts/$id/zip"
-    if ($LASTEXITCODE -ne 0) { Remove-Item "$dest.partial" -ErrorAction SilentlyContinue; throw "download of artifact $id failed" }
-    Move-Item -Force "$dest.partial" $dest
+    foreach ($wait in 0, 15, 60, 180) {
+        if ($wait) { Write-Host "    retrying in $wait s"; Start-Sleep $wait }
+        $code = & curl.exe -sS -L --fail -w "%{http_code}" -H "Authorization: Bearer $token" `
+            -H "Accept: application/vnd.github+json" -o "$dest.partial" `
+            "https://api.github.com/repos/$Repo/actions/artifacts/$id/zip" 2>$null
+        if ($LASTEXITCODE -eq 0) { Move-Item -Force "$dest.partial" $dest; return $true }
+        Remove-Item "$dest.partial" -ErrorAction SilentlyContinue
+        Write-Host "    artifact $id download failed (HTTP $code)"
+    }
+    $script:failures++
+    return $false
 }
+$script:failures = 0
 
-$artifacts = gh api --paginate "repos/$Repo/actions/artifacts?per_page=100" `
-    -q '.artifacts[] | select(.expired == false) | [.id, .name, .size_in_bytes, .created_at] | @tsv' |
+$list = gh api --paginate "repos/$Repo/actions/artifacts?per_page=100" `
+    -q '.artifacts[] | select(.expired == false) | [.id, .name, .size_in_bytes, .created_at] | @tsv'
+if ($LASTEXITCODE -ne 0) { Write-Warning "GitHub didn't return the artifact list (server error?). Try again later."; return }
+$artifacts = $list |
     ForEach-Object { $f = $_ -split "`t"; [pscustomobject]@{ Id = [long]$f[0]; Name = $f[1]; Size = [long]$f[2]; Created = $f[3] } }
 # Only results made from the current index count (an earlier index, e.g. a test, cut its buckets differently)
 $index = $artifacts | Where-Object Name -eq "index" | Sort-Object Created | Select-Object -Last 1
@@ -53,7 +65,7 @@ foreach ($a in $done) {
     $db = Join-Path $buckets "$($a.Name).db"
     if (Test-Path $db) { continue }
     $zip = Join-Path $buckets "$($a.Name).zip"
-    Get-Artifact $a.Id $zip
+    if (-not (Get-Artifact $a.Id $zip)) { continue }
     $tmp = Join-Path $buckets "$($a.Name).tmp"
     Expand-Archive -Force $zip $tmp
     Copy-Item -Force (Join-Path $tmp "parking.db.gz") (Join-Path $dbOut "$($a.Name).db.gz")
@@ -69,13 +81,16 @@ if (-not $NoImages) {
     foreach ($a in $images) {
         $zip = Join-Path $imgOut "$($a.Name)-$($a.Id).zip"
         if (Test-Path $zip) { continue }
-        Get-Artifact $a.Id $zip
+        if (-not (Get-Artifact $a.Id $zip)) { continue }
         attrib.exe +U -P $zip | Out-Null   # online-only: OneDrive uploads it, then frees the local copy
         $newImg++
         Write-Host ("  images   {0} ({1:N0} MB)" -f $a.Name, ($a.Size / 1MB))
     }
 }
 Write-Host "downloaded $newDb new bucket databases and $newImg new image archives"
+if ($script:failures) {
+    Write-Warning "$($script:failures) downloads failed even after retries (GitHub server errors). Run this again later; finished downloads are skipped."
+}
 
 if ($Merge) {
     $script = Join-Path $PSScriptRoot "parking_pipeline.py"

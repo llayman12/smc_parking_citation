@@ -3,24 +3,24 @@ Seattle Municipal Court parking-citation pipeline.
 
 Stages (each is resumable; state lives in a SQLite database):
 
-  search   Page through the public citation search API one day at a time and
-           record parking citations (9-digit numeric citation numbers in the
-           Infraction category). No names or plates are stored.
-  fetch    For each new citation, find the "Complaint - Parking Citation"
-           docket entry, download its PDF, keep only the page-1 ticket image
-           (the vehicle photos are discarded), and optionally pull charges.
-  ocr      OCR each ticket image with Tesseract and parse the printed fields
-           (violation, SMC section, fine, infraction location, plate state,
-           officer ID, infraction date/time, public comments).
-  geocode  Send unique infraction locations to the U.S. Census batch geocoder
-           and attach lat/lon and census tract.
-  export   Write a flat CSV for analysis.
-  status   Show how many citations are at each stage.
+  search    Page through the public citation search API one day at a time (days in
+            parallel) and record parking citations: 9-digit numeric citation numbers
+            in the Infraction category, excluding Seattle Animal Control.
+  fetch     For each new citation, find its ticket PDF, download it and keep only the
+            page-1 ticket image. With --ocr, OCR each image as soon as it lands.
+  ocr       OCR ticket images with Tesseract and parse the printed fields (violation,
+            SMC section, fine, infraction location, plate state, officer ID, date/time,
+            public comments). Handwritten scans are flagged for manual entry.
+  geocode   Send unique infraction locations to the U.S. Census batch geocoder and
+            attach lat/lon and census tract.
+  export    Write a flat CSV for analysis.
+  status    Show how many citations are at each stage.
+  remaining / backup / merge   Tools for running the date range as day shards
+            (--shard K/N) on several machines. See README.md.
 
 Examples (PowerShell):
   python parking_pipeline.py search --from 2025-11-01 --to 2025-11-07
-  python parking_pipeline.py fetch --limit 50
-  python parking_pipeline.py ocr
+  python parking_pipeline.py fetch --ocr --delete-images
   python parking_pipeline.py geocode
   python parking_pipeline.py export --out parking_citations.csv
 """

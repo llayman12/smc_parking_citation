@@ -417,6 +417,15 @@ def cmd_fetch(args):
                 print(f"  ! OCR {cn}: {e}", file=sys.stderr)
         db.commit()
 
+    if ocr_pool:
+        # tickets downloaded by an earlier run that stopped before OCR finished: OCR them now, or
+        # they would sit at 'fetched' forever (fetch only picks up 'new' rows)
+        leftover = db.execute("SELECT citation_number, image_path FROM citations WHERE status='fetched'").fetchall()
+        for r in leftover:
+            ocr_futures[ocr_pool.submit(ocr_image, tess, r["image_path"])] = (r["citation_number"], r["image_path"])
+        if leftover:
+            print(f"{len(leftover)} tickets from an interrupted run queued for OCR")
+
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         work = lambda r: fetch_one(c, r["citation_number"], r["case_uuid"], img_dir, args.with_charges)
         for i, (row, fut) in enumerate(bounded(pool, work, rows, args.workers * 2, args), 1):

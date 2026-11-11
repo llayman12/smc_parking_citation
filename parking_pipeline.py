@@ -47,6 +47,7 @@ TZ = ZoneInfo("America/Los_Angeles")
 PARKING_CITATION_RE = re.compile(r"^\d{9}$")  # 13-digit = traffic camera, 9A9999999 = officer traffic
 # 9-digit infractions from these agencies are not parking tickets (129x Animal Control = "Traffic - MCIS Legacy")
 NON_PARKING_AGENCIES = {"Seattle Animal Control"}
+EMPTY_STREAK_LIMIT = 15  # this many "no documents at all" results in a row = bad server responses, not real
 CENSUS_BATCH ="https://geocoding.geo.census.gov/geocoder/geographies/addressbatch"
 
 SCHEMA = """
@@ -142,6 +143,13 @@ class Client:
                 self._clean_streak = 0
                 print(f"  + {self.recover_after} clean responses; easing up to {1 / self.interval:.2f} req/s",
                       file=sys.stderr)
+
+    def slow_down(self, why):
+        """Halve the rate on a sign of trouble that isn't an HTTP error (e.g. suspicious empty responses)."""
+        with self._lock:
+            self.interval = min(self.max_interval, self.interval * 2)
+            self._clean_streak = 0
+        print(f"  ! {why}; rate cut to {1 / self.interval:.2f} req/s", file=sys.stderr)
 
     def _fail(self, attempt):
         backoff = 5 * 3 ** attempt
@@ -379,6 +387,16 @@ def fetch_one(c, cn, case, img_dir, with_charges):
         return {"status": "error", "error": str(e)[:500], "msg": f"ERROR {e}"}
 
 
+def case_has_documents(c, case):
+    """Recheck used by the empty-response circuit breaker."""
+    try:
+        acc = c.get(f"{API}/courts/cms/docketentrydocumentsaccess", params={
+            "page": 0, "size": 5, "caseHeader.courtID": COURT, "caseHeader.caseInstanceUUID": case}).json()
+        return bool(acc.get("_embedded", {}).get("results"))
+    except Exception:
+        return False
+
+
 def cmd_fetch(args):
     """Work through citations recorded by `search`. Workers do the network calls in parallel;
     this thread does all database writes (SQLite connections aren't shared across threads).
@@ -429,10 +447,35 @@ def cmd_fetch(args):
         if leftover:
             print(f"{len(leftover)} tickets from an interrupted run queued for OCR")
 
+    # Circuit breaker for silent bad responses. Under strain the server has answered 200 OK with EMPTY
+    # document lists for whole runs of cases (seen: 217 in one minute). Some periods genuinely have no ticket
+    # documents (e.g. January 2024), so a streak triggers a recheck rather than a verdict: after a pause, ask
+    # again for the last few cases. Documents now -> the empties were bad: re-queue them and slow down.
+    # Still empty -> real: accept, and don't recheck again until a case with documents breaks the run.
+    empty_streak, streak_is_real = [], False
+
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         work = lambda r: fetch_one(c, r["citation_number"], r["case_uuid"], img_dir, args.with_charges)
         for i, (row, fut) in enumerate(bounded(pool, work, rows, args.workers * 2, args), 1):
             cn, res = row["citation_number"], fut.result()
+            if res["status"] == "no_doc" and res.get("error") == "pdfs: []":
+                if not streak_is_real:
+                    empty_streak.append((cn, row["case_uuid"]))
+            elif res["status"] in ("fetched", "no_doc"):
+                empty_streak, streak_is_real = [], False
+            if len(empty_streak) >= EMPTY_STREAK_LIMIT:
+                time.sleep(30)
+                if any(case_has_documents(c, case) for _, case in empty_streak[-3:]):
+                    db.commit()
+                    db.executemany("UPDATE citations SET status='new', error=NULL WHERE citation_number=?",
+                                   [(x,) for x, _ in empty_streak])
+                    db.commit()
+                    c.slow_down(f"{len(empty_streak)} empty document lists that had documents on recheck")
+                    print(f"  ! re-queued {len(empty_streak)} bad empty responses; pausing 2 min", file=sys.stderr)
+                    time.sleep(120)
+                    empty_streak = []
+                    continue  # this row's result below would be one of the bad ones; it was re-queued above
+                streak_is_real, empty_streak = True, []
             counts[res["status"]] = counts.get(res["status"], 0) + 1
             extra = res.get("extra") or {}
             sets = "".join(f", {k}=?" for k in extra)

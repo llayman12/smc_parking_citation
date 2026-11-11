@@ -1,7 +1,8 @@
 # Runs the parking citation pipeline in ~5-hour chunks.
 #
-# The work is split by day into TOTAL_SHARDS shards (day ordinal % TOTAL_SHARDS). GitHub runs the shards in
-# GH_SHARDS; the others run on local machines (run_shard.ps1). Each shard keeps its own database, carried
+# The work is split by day into TOTAL_SHARDS shards (day ordinal % TOTAL_SHARDS). GitHub runs shards 0-2
+# (shard 2 moved here from a local PC via the "seed" release); shard 3 runs on a Linux host
+# (linux/run_shard.sh). Each shard keeps its own database, carried
 # between GitHub runs as the "state-shard-K-of-N" artifact, and each shard job queues its own next run
 # until its days are searched and its citations fetched. The schedule is only a backstop in case a chain
 # breaks; per-shard concurrency keeps it to one job per shard. Shards never overlap; combine them at the
@@ -12,8 +13,8 @@ on:
   workflow_dispatch:
     inputs:
       shards:
-        description: "JSON list of shards to run, e.g. [0,1] or [1]"
-        default: "[0,1]"
+        description: "JSON list of shards to run, e.g. [0,1,2] or [1]"
+        default: "[0,1,2]"
       interval:
         description: "Seconds between API requests per shard (0.2 = 5 per second)"
         default: "0.2"
@@ -41,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(inputs.shards || '[0,1]') }}
+        shard: ${{ fromJSON(inputs.shards || '[0,1,2]') }}
     concurrency:
       group: parking-shard-${{ matrix.shard }}
       cancel-in-progress: false
@@ -74,6 +75,11 @@ jobs:
             gh run download "$run_id" -n "$ARTIFACT" -D "$DATA"
             gunzip -f "$DATA/parking.db.gz"
             echo "restored shard $K state from run $run_id ($(du -h "$DATA/parking.db" | cut -f1))"
+          elif gh release download seed -R "$GITHUB_REPOSITORY" -p "parking-shard-$K-of-4.db.gz" -D "$DATA" 2>/dev/null; then
+            # a shard moved here from another machine starts from the database it uploaded to the "seed" release
+            mv "$DATA/parking-shard-$K-of-4.db.gz" "$DATA/parking.db.gz"
+            gunzip -f "$DATA/parking.db.gz"
+            echo "restored shard $K from the seed release ($(du -h "$DATA/parking.db" | cut -f1))"
           else
             echo "no previous state for shard $K; starting fresh"
           fi

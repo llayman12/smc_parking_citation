@@ -94,11 +94,28 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # The .deb files are cached so a job doesn't depend on Ubuntu's package mirror being reachable: on
+      # 2026-11-11 a mirror DNS outage (06:00-09:00 Seattle time) failed 76 bucket jobs at this step.
+      - uses: actions/cache@v4
+        with:
+          path: ~/tesseract-debs
+          key: tesseract-debs-${{ runner.os }}-noble-v1
+
       - name: Install Tesseract and Python packages
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q tesseract-ocr
-          pip install -q -r requirements.txt
+          if ls ~/tesseract-debs/*.deb >/dev/null 2>&1; then
+            sudo dpkg -i ~/tesseract-debs/*.deb
+          else
+            for attempt in 1 2 3 4 5; do
+              sudo apt-get update -q -o Acquire::Retries=3 && \
+              sudo apt-get install -y -q -o Acquire::Retries=5 --download-only tesseract-ocr && break
+              echo "apt attempt $attempt failed; retrying in $((attempt * 60))s"; sleep $((attempt * 60))
+            done
+            mkdir -p ~/tesseract-debs && cp /var/cache/apt/archives/*.deb ~/tesseract-debs/
+            sudo dpkg -i ~/tesseract-debs/*.deb
+          fi
+          tesseract --version | head -1
+          pip install -q --retries 10 -r requirements.txt
           printf 'NNN=%03d\n' "${{ matrix.bucket }}" >> "$GITHUB_ENV"
 
       - name: Get the index and any partial work on this bucket
@@ -118,7 +135,9 @@ jobs:
         id: work
         run: |
           start=$(date +%s)
-          P="python -u parking_pipeline.py --data-dir data --interval $INTERVAL --stop-at $((start + 300 * 60))"
+          # nightly quiet window or an announced outage: wait it out (the job has time for both)
+          python -u parking_pipeline.py wait-maintenance --max-minutes 270
+          P="python -u parking_pipeline.py --data-dir data --interval $INTERVAL --stop-at $((start + 320 * 60))"
           LIMIT="${{ inputs.smoke && '--limit 40' || '' }}"
           $P take-bucket --index index/parking.db --bucket "${{ matrix.bucket }}"
           $P fetch --ocr --ocr-workers 4 --workers 12 $LIMIT

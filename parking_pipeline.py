@@ -54,13 +54,24 @@ NON_PARKING_AGENCIES = {"Seattle Animal Control"}
 MAINTENANCE_WINDOWS = [("2026-11-13T13:15", "2026-11-15T12:30")]
 
 
+# Every night the portal slows sharply on its own: on 2026-11-11 from ~00:00 to ~04:00 average latency was
+# 9-15 s and 169 requests failed while this project sent only 0.4 req/s in total, against 1.4 s at 11 req/s
+# at 05:00. Working through it gains almost nothing and adds load while the court's own processing runs.
+NIGHTLY_QUIET = ("00:00", "04:30")  # Seattle time; set to None to disable
+
+
 def maintenance_end():
-    """If now is inside an announced outage, return its end (aware datetime); else None."""
+    """If now is inside an announced outage or the nightly quiet window, return when it ends
+    (aware datetime); else None."""
     t = datetime.now(TZ)
     for a, b in MAINTENANCE_WINDOWS:
         start, end = (datetime.fromisoformat(x).replace(tzinfo=TZ) for x in (a, b))
         if start <= t < end:
             return end
+    if NIGHTLY_QUIET:
+        qa, qb = (datetime.strptime(x, "%H:%M").time() for x in NIGHTLY_QUIET)
+        if qa <= t.time() < qb:
+            return datetime.combine(t.date(), qb, tzinfo=TZ)
     return None
 
 
@@ -926,7 +937,8 @@ def cmd_wait_maintenance(args):
     if not end:
         return
     limit = time.time() + args.max_minutes * 60 if args.max_minutes else None
-    print(f"portal maintenance until {end:%a %b %d %H:%M} Seattle time; waiting", flush=True)
+    print(f"portal maintenance or nightly quiet window until {end:%a %b %d %H:%M} Seattle time; waiting",
+          flush=True)
     while maintenance_end() and (limit is None or time.time() < limit):
         time.sleep(60)
 

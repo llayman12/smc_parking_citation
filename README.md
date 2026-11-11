@@ -419,9 +419,21 @@ the slower stage.
 | 2026-11-10 ~22:13 | ~10 req/s from one IP | 217 per-case document lookups in one minute came back `200 OK` with **empty lists**. |
 | 2026-11-10 ~22:15–22:35 | ~20 req/s total from 4 sources | Latency rose from ~1 s to 10–40 s on two machines at once, with no HTTP errors; back to 0.3 s by 22:38. |
 
-**These are one evening's events and prove little.** Both happened in the same 20 minutes, so they may be
-one cause, and that cause may be the court's own nightly processing rather than this project's load. They
-are not a measured ceiling.
+| 2026-11-10 23:50–24:00 | index build, 4 sources | Same pattern; the latency guard cut two search jobs to 0.1–0.2 req/s. |
+| **2026-11-11 00:00–04:00** | **0.4 req/s total** (4 bucket jobs held at the minimum) | Average latency **9–15 s**, worst 119 s, 169 failed requests. |
+| **2026-11-11 05:00–06:00** | **11.3 req/s total** | Average latency **1.4 s**, no failures. |
+| 2026-11-11 09:00–12:00 | 4–8.5 req/s total | Average latency 0.7–1.5 s, no failures. |
+
+**Conclusion (from `latency_log`, 17 buckets):** the late-night slowdowns are the court's own processing, not
+this project's load. Between midnight and 4 AM the portal was slow even at 0.4 req/s; an hour later it
+served 11 req/s at normal speed. So:
+
+- **Nightly quiet window.** `NIGHTLY_QUIET = ("00:00", "04:30")` in `parking_pipeline.py`: no requests in
+  that window. Bucket jobs that start in it wait; jobs working when it begins save as `part-NNN`; the planner
+  plans nothing. (The first four buckets ran straight through it and took 4.7 hours each instead of ~50
+  minutes.)
+- **Daytime capacity.** 4 workers at 3.3 req/s ran without errors. 11 req/s total was absorbed at normal
+  latency, so 6 workers would very likely be fine during the day.
 
 ### How limits are measured now
 
@@ -446,9 +458,10 @@ If latency tracks the clock rather than the project's own rate, the slow periods
 | Stage | Throughput | Basis |
 |---|---|---|
 | Index (search + document listing, all days) | ~45 min, ~20,000 requests | 4 jobs at 5 req/s; search measured at ~19 days/minute per source |
-| Fetch | 1 request per ticket; up to ~12,000/hour per worker at 3.3 req/s | measured ~10,800/hour locally |
-| OCR | ~1.3 CPU-seconds per ticket → ~11,000/hour on 4 cores | measured on the PC; GitHub runners may be slower |
-| All ~2 million tickets, 4 workers | roughly 2–3 days | estimate; OCR-bound |
+| Bucket job (≈8,700 tickets: fetch + OCR) | **44–65 minutes** on a GitHub runner | measured, 13 buckets in daytime |
+| All 256 buckets, 4 workers | ~56 hours of daytime work → about 3 days with the nightly pause | from the measured bucket time |
+
+Measured per bucket (17 buckets): ~8,600 tickets OCR'd, ~375 known `no_doc`, 0–2 errors.
 
 Compared with the first design (two requests per ticket, four sources at 5 req/s): about the same wall
 time for **half the requests** to the court.
@@ -564,7 +577,8 @@ Global options (before the subcommand):
 
 | Symptom | Cause / fix |
 |---|---|
-| `buckets` run plans 0 buckets | No `index` artifact yet (run `index.yml`), an announced portal outage, or everything is done. The plan job's log says which. |
+| `buckets` run plans 0 buckets | No `index` artifact yet (run `index.yml`), the nightly quiet window or an announced outage, or everything is done. The plan job's log says which. |
+| Many bucket jobs fail at "Install Tesseract" | Ubuntu's package mirror was unreachable. The packages are now cached (`actions/cache`) and the install retries; re-dispatch to redo the failed buckets. |
 | A bucket job failed | Re-dispatch `buckets.yml`; it plans only what is missing and resumes `part-NNN` if there is one. |
 | `existing database doesn't match bucket N of this index` | Partial work from an older index; the bucket starts over. Expected after rebuilding the index. |
 | Index job fails with `N days could not be completed` | Three passes weren't enough (server trouble). Re-run the workflow. |

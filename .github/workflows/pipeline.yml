@@ -90,6 +90,7 @@ jobs:
           start=$(date +%s)
           P="python -u parking_pipeline.py --data-dir $DATA --shard $K/$TOTAL_SHARDS --interval $INTERVAL"
           RETRY=${{ inputs.retry && '--retry' || '' }}
+          $P wait-maintenance --max-minutes 270   # announced court portal outage: wait, then save and requeue
           $P --stop-at $((start + 260 * 60)) search --from "$FROM" --to "$TO"
           $P --stop-at $((start + 280 * 60)) fetch --ocr --ocr-workers 4 --delete-images all $RETRY
           $P --stop-at $((start + 300 * 60)) geocode

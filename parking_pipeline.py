@@ -47,6 +47,22 @@ TZ = ZoneInfo("America/Los_Angeles")
 PARKING_CITATION_RE = re.compile(r"^\d{9}$")  # 13-digit = traffic camera, 9A9999999 = officer traffic
 # 9-digit infractions from these agencies are not parking tickets (129x Animal Control = "Traffic - MCIS Legacy")
 NON_PARKING_AGENCIES = {"Seattle Animal Control"}
+# Announced portal outages (Seattle local time), padded 15-30 min. No requests are made inside a window:
+# a portal mid-maintenance can return errors or, worse, empty answers that look like real data.
+# Source: seattle.gov/courts/programs-and-services/public-records-requests (checked 2026-11-10).
+MAINTENANCE_WINDOWS = [("2026-11-13T13:15", "2026-11-15T12:30")]
+
+
+def maintenance_end():
+    """If now is inside an announced outage, return its end (aware datetime); else None."""
+    t = datetime.now(TZ)
+    for a, b in MAINTENANCE_WINDOWS:
+        start, end = (datetime.fromisoformat(x).replace(tzinfo=TZ) for x in (a, b))
+        if start <= t < end:
+            return end
+    return None
+
+
 EMPTY_STREAK_LIMIT = 15  # this many "no documents at all" results in a row = bad server responses, not real
 CENSUS_BATCH ="https://geocoding.geo.census.gov/geocoder/geographies/addressbatch"
 
@@ -210,7 +226,10 @@ def connect(data_dir):
 
 
 def past_deadline(args):
-    """True once --stop-at (unix time) has passed: stop starting new work so state can be saved."""
+    """True once --stop-at (unix time) has passed, or during an announced portal outage:
+    stop starting new work so state can be saved."""
+    if maintenance_end():
+        return True
     return bool(args.stop_at) and time.time() >= args.stop_at
 
 
@@ -671,7 +690,7 @@ def cmd_geocode(args):
              AND infraction_location NOT IN (SELECT location FROM geocodes)""")]
     print(f"{len(locs)} unique locations to geocode")
     for start in range(0, len(locs), args.batch):
-        if past_deadline(args):
+        if args.stop_at and time.time() >= args.stop_at:  # Census geocoder: court outages don't apply
             print("stopped at --stop-at deadline; rerun to continue")
             break
         chunk = locs[start:start + args.batch]
@@ -758,6 +777,18 @@ def cmd_merge(args):
     cmd_status(args)
 
 
+def cmd_wait_maintenance(args):
+    """Sleep through an announced portal outage (at most --max-minutes), so runners neither error out
+    nor record bad data while the portal is down."""
+    end = maintenance_end()
+    if not end:
+        return
+    limit = time.time() + args.max_minutes * 60 if args.max_minutes else None
+    print(f"portal maintenance until {end:%a %b %d %H:%M} Seattle time; waiting", flush=True)
+    while maintenance_end() and (limit is None or time.time() < limit):
+        time.sleep(60)
+
+
 def cmd_remaining(args):
     """Print how much work is left for this shard: unsearched days + citations not yet fetched/OCR'd."""
     db = connect(args.data_dir)
@@ -832,7 +863,11 @@ def main():
 
     sub.add_parser("status").set_defaults(func=cmd_status)
 
-    s = sub.add_parser("remaining", help="print the amount of work left for this shard (0 = done)")
+    s = sub.add_parser("wait-maintenance", help="sleep through an announced portal outage")
+    s.add_argument("--max-minutes", type=float, help="give up waiting after this long (for CI time limits)")
+    s.set_defaults(func=cmd_wait_maintenance)
+
+    s = sub.add_parser("remaining",help="print the amount of work left for this shard (0 = done)")
     s.add_argument("--from", dest="date_from", required=True)
     s.add_argument("--to", dest="date_to", required=True)
     s.set_defaults(func=cmd_remaining)

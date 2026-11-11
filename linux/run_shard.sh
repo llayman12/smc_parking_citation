@@ -32,6 +32,7 @@ fi
 p() { nice -n 19 "$PY" -u "$HERE/parking_pipeline.py" --data-dir "$DATA" --shard "$SHARD/$OF" --interval "$INTERVAL" "$@" 2>&1 | tee -a "$DATA/run.log"; }
 
 while true; do
+  p wait-maintenance   # sleeps through announced court portal outages
   stop=$(( $(date +%s) + CHUNK_MIN * 60 ))
   echo "=== $(date -Is) shard $SHARD/$OF chunk until $(date -d @$stop +%H:%M)" | tee -a "$DATA/run.log"
   p --stop-at "$stop" search --from "$FROM" --to "$TO"

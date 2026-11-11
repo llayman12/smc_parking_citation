@@ -28,7 +28,8 @@ function Py([string[]]$a) {
 }
 
 while ($true) {
-    $stop = [int][double]::Parse((Get-Date -UFormat %s)) + $ChunkMinutes * 60
+    Py @("wait-maintenance")   # sleeps through announced court portal outages
+    $stop =[int][double]::Parse((Get-Date -UFormat %s)) + $ChunkMinutes * 60
     Write-Host "`n=== $(Get-Date -Format s)  shard $Shard/$Of chunk until $((Get-Date).AddMinutes($ChunkMinutes).ToString('HH:mm'))" -ForegroundColor Cyan
     Py @("--stop-at", "$stop", "search", "--from", $From, "--to", $To)
     Py @("--stop-at", "$stop", "fetch", "--ocr", "--delete-images", "all")

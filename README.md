@@ -22,15 +22,17 @@ which is what makes this a multi-day, multi-machine job.
 7. [Exported CSV](#exported-csv)
 8. [Running at scale: shards](#running-at-scale-shards)
 9. [Runner: GitHub Actions](#runner-github-actions-shards-0-and-1)
-10. [Runner: Windows PC](#runner-windows-pc-shard-2)
+10. [Runner: Windows PC](#runner-windows-pc)
 11. [Runner: Linux host without root](#runner-linux-host-without-root-shard-3-ovid12)
 12. [Combining shards and exporting](#combining-shards-and-exporting)
 13. [Rate limiting and server courtesy](#rate-limiting-and-server-courtesy)
-14. [Performance](#performance)
-15. [Known data gaps and caveats](#known-data-gaps-and-caveats)
-16. [Notes for the analysis](#notes-for-the-analysis)
-17. [Command reference](#command-reference)
-18. [Troubleshooting](#troubleshooting)
+14. [API limits: research and observations](#api-limits-research-and-observations)
+15. [Performance](#performance)
+16. [Known data gaps and caveats](#known-data-gaps-and-caveats)
+17. [Notes for the analysis](#notes-for-the-analysis)
+18. [Next phase: month work units](#next-phase-month-work-units)
+19. [Command reference](#command-reference)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -233,10 +235,23 @@ giving each machine a block of years) spreads every year across all four, so all
 
 | Shard | Runs on | Database lives | Backup |
 |---|---|---|---|
-| 0 | GitHub Actions | runner disk | `state-shard-0-of-4` artifact (7-day retention, replaced every run) |
+| 0 | GitHub Actions | runner disk | `state-shard-0-of-4` artifact (3-day retention, replaced every run) |
 | 1 | GitHub Actions | runner disk | `state-shard-1-of-4` artifact |
-| 2 | Windows PC | `C:\SMCData\shard-2-of-4` | optional `-BackupDir` |
+| 2 | GitHub Actions (moved from the Windows PC on 2026-11-10, started from the `seed` release) | runner disk | `state-shard-2-of-4` artifact |
 | 3 | UW Linux host `ovid12` | `/var/tmp/smc-llayman/shard-3-of-4` | `~/smc_backup/parking-shard-3-of-4.db.gz`, hourly |
+
+**Moving a shard to GitHub.** Stop it where it runs, snapshot and compress its database, and attach it to
+the `seed` release; the workflow restores a shard from `seed` only when it has no state artifact yet:
+
+```powershell
+python parking_pipeline.py --data-dir C:\SMCData\shard-2-of-4 backup --to C:\SMCData\seed\parking-shard-2-of-4.db
+python -c "import gzip,shutil; shutil.copyfileobj(open(r'C:\SMCData\seed\parking-shard-2-of-4.db','rb'), gzip.open(r'C:\SMCData\seed\parking-shard-2-of-4.db.gz','wb'))"
+gh release create seed C:\SMCData\seed\parking-shard-2-of-4.db.gz -R llayman12/smc_parking_citation --title "Seed databases" --notes "Starting databases for shards moved to GitHub Actions."
+gh workflow run pipeline.yml -R llayman12/smc_parking_citation -f shards="[2]"
+```
+
+Never run the same shard in two places at once: both would fetch the same tickets and their databases
+would diverge. The retired local copy is renamed `C:\SMCData\shard-2-of-4.moved-to-github`.
 
 All shards cover **2020-01-01 to 2026-10-31**. To change the shard count, every shard must start over
 with fresh databases (a database is locked to its `K/N`).
@@ -276,7 +291,10 @@ schedule stops.
 
 ---
 
-## Runner: Windows PC (shard 2)
+## Runner: Windows PC
+
+Shard 2 ran here until it moved to GitHub on 2026-11-10. The script works for any shard on any Windows
+machine:
 
 ```powershell
 .\run_shard.ps1 -Shard 2
@@ -376,9 +394,57 @@ All requests from one process go through a shared `Client`:
 - Fetch prints the current rate, average latency and failure count every 100 tickets. Rising latency is the
   signal to lower `--interval` or `--workers`.
 
-With four shards the court sees up to ~20 requests/second in total. The API's published notes place no
-restrictions on automated access to this kind of search, and no rate-limit headers or 429 responses have
-been observed.
+- **Silent bad responses.** Under strain the server has answered `200 OK` with *empty* document lists. A run
+  of 15 "no documents at all" results triggers a recheck of the last 3 cases after 30 s; if documents appear
+  now, the run is re-queued and the rate halved. If they are still empty (some periods genuinely have no
+  ticket documents) the run is accepted.
+- **Announced outages.** `MAINTENANCE_WINDOWS` in `parking_pipeline.py` lists portal maintenance windows
+  (Seattle time). No requests are made inside one; runners sleep through it (`wait-maintenance`), and GitHub
+  jobs wait up to 270 minutes, then save and requeue. Add new windows as the court announces them on its
+  [public records page](https://seattle.gov/courts/programs-and-services/public-records-requests).
+
+See [API limits: research and observations](#api-limits-research-and-observations) for what is known about
+the server's capacity.
+
+---
+
+## API limits: research and observations
+
+### What the documentation says (researched 2026-11-10)
+
+- **Software.** The court's case management system is Thomson Reuters **C-Track** (with **cFive** for
+  probation), which replaced the legacy MCIS system around March 2024 ([SMC technology page](https://seattle.gov/courts/about/technology)).
+  Pre-2024 cases were migrated, which is why older tickets have different document names and layouts.
+  The portal API (`courtrecords-api.seattle.gov`) is a Spring Boot service; it publishes an OpenAPI 3
+  description at `/v3/api-docs` titled "Public Portal APIs" (238 paths).
+- **No published limits.** The OpenAPI description defines no security scheme and says nothing about rate
+  limits, quotas or acceptable use. Responses carry no rate-limit headers (`X-RateLimit-*`, `Retry-After`),
+  only standard security headers. The portal's public configuration endpoints (`/features`, `/courts`,
+  `/quicklinks`, `/announcements`) contain no usage terms. The admin `actuator` endpoints listed in the
+  OpenAPI description were deliberately not queried.
+- **Court policy on bulk data.** The court's public records page states: "Requests for court data or bulk
+  court records from the court's case management system must be submitted through our Public Records
+  Portal" (`smc-seattle.mycusthelp.com`), and cites General Rule 31 (Access to Court Records) and JISCR 15
+  (Data Dissemination). It says nothing specific about automated use of the online portal. **Consider this
+  before publishing or repeating the collection**: a records request, or written permission for API use,
+  would put the dataset on firmer footing.
+
+### What the pipeline has observed
+
+| When (Seattle time) | Load | What happened |
+|---|---|---|
+| Nov 4–10 tests | 1–5 req/s from one source | No errors, latency 0.3–4 s. |
+| 2026-11-10 ~22:13 | ~10 req/s from **one IP** (a shard plus a test run on the same PC) | 217 cases in one minute came back `200 OK` with **empty document lists** (false "no document"). Other machines did not see it. Suggests a silent per-source limit or overload that returns empty results instead of errors. |
+| 2026-11-10 ~22:15–22:35 | ~20 req/s total from 4 sources | **Server-wide slowdown:** average latency rose from ~1 s to 10–40 s on two different machines at the same time, with no HTTP errors. The latency guard cut each shard from 5 to 0.3 req/s; latency returned to 0.3 s by 22:38. |
+
+Working conclusions:
+- **Per source:** stay at ≤ 5 req/s. ~10 req/s from one IP produced silently wrong answers.
+- **Total:** ~20 req/s across all sources is at or near what the server tolerates at night. More sources
+  or higher rates are likely to slow the portal for the public and to return bad data.
+- **No stress-testing.** Deliberately ramping requests until the server fails was considered and rejected:
+  the server already showed strain at current load, the failure mode is silent bad data rather than clean
+  429s, and the portal serves the public. Limits are instead measured passively from production logs: the
+  `-- ... req/s cap, avg latency ...` progress lines and `! server slowing` / `! re-queued` events.
 
 ---
 
@@ -408,6 +474,9 @@ for 2020–October 2026, about 3–4 days of wall time across four shards.
   ```sql
   SELECT substr(violation_date,1,7) AS month, status, COUNT(*) FROM citations GROUP BY 1, 2;
   ```
+- **False "no document" results.** Before the circuit breaker existed, a burst of empty server responses
+  (2026-11-10 ~22:13) marked 239 shard-2 tickets `no_doc`; they were reset to `new` in the seed. Other
+  shards may hold a few such rows. The final `retry=true` / `fetch --retry` pass rechecks every `no_doc`.
 - **Geocoding misses.** About 2–3% of distinct printed locations returned `No_Match` from the Census
   geocoder even though they look valid (e.g. `1222 HARBOR AVE SW`). A second geocoder could recover them.
 - **Handwritten tickets** (~0.5%) have no parsed fields and need manual entry. They may not be a random subset.
@@ -438,6 +507,56 @@ for 2020–October 2026, about 3–4 days of wall time across four shards.
 
 ---
 
+## Next phase: month work units
+
+The current run uses **static day shards**: each machine owns a fixed quarter of the days. It works, but it
+showed its limits during this run:
+
+- one machine stopping stalls its whole quarter (the reason shard 2 had to move to GitHub);
+- the finish waits for the slowest shard;
+- changing the number of machines means starting over;
+- each GitHub shard re-uploads one ever-growing database every run, and it is lost if a chain stays
+  broken longer than the artifact retention.
+
+For the next collection (e.g. extending the data each year, or a re-run), switch to **dynamic assignment of
+month-sized work units**. Throughput is the same (it is set by sources × rate, see
+[API limits](#api-limits-research-and-observations)); what changes is flexibility and durability.
+
+### Design
+
+| Piece | Design |
+|---|---|
+| Unit of work | One calendar month. ~28,000 tickets ≈ 3 h of fetch + OCR at 9,000/hour, so **one 6-hour GitHub job finishes one month**, search included (~2 min). 2020-01 … 2026-10 = 82 units. Split a month in halves if any exceeds ~40,000 tickets. |
+| Result of a unit | A small, finished SQLite database (`parking-YYYY-MM.db.gz`, ~15 MB), attached to a GitHub **release** (`months`). Release assets don't expire, so finished work is permanent. |
+| What's done | The list of assets on the `months` release. |
+| Claims | Before starting a month, a worker pushes the Git tag `claim/YYYY-MM`. Tag creation is atomic: if it already exists, another worker has it, so pick the next month. The claim records the worker and time; a claim older than 8 hours with no asset is stale and may be deleted and retaken. |
+| Planner | A small GitHub job (on dispatch and every 2 h) lists months with neither an asset nor a live claim and starts a matrix of up to N workers (N = 4 by default, the total-load ceiling). |
+| Worker | `parking_pipeline.py work-month --month YYYY-MM`: search the month's days → fetch with inline OCR → geocode → upload the asset → delete the claim. Same code on GitHub, a PC or ovid12; a non-GitHub worker just loops "claim next month → work → upload". |
+| Stopping a machine | Its claim goes stale and the month is retaken from scratch. At most one month (~3 h) of work is lost. |
+| Retries | `fetch --retry` per month: reopen a month, retry its `error`/`no_doc` rows, re-upload. |
+| Final dataset | `merge` all `parking-*.db.gz` assets, then `export`. |
+| Rate limits | Unchanged: ≤ 5 req/s per worker, ≤ 4 workers at once, latency guard, empty-response breaker, maintenance windows. |
+
+### Transition steps
+
+1. Finish the current shard run (all four `remaining` = 0, one `retry=true` pass) and merge it. This is the
+   2020-01 … 2026-10 baseline.
+2. Add `--month YYYY-MM` (sets `--from/--to` to that month) and a `work-month` command that wraps search → fetch
+   → geocode → upload, plus `claim`/`release` helpers using `git push origin refs/tags/claim/YYYY-MM`.
+3. Add `.github/workflows/months.yml` (planner + worker matrix, `contents: write` permission for tags and
+   release assets). Retire `pipeline.yml`'s shard matrix.
+4. Add `run_months.ps1` / `linux/run_months.sh` loops for non-GitHub workers.
+5. Optionally split the baseline into month assets (`merge` already handles any set of databases), so
+   future months append to the same `months` release.
+6. Each new month: dispatch the planner after the month ends (plus a few weeks for late filings); it will
+   find one unclaimed unit and run it.
+
+Before the next phase, weigh the court's stated channel for bulk data (see
+[API limits](#api-limits-research-and-observations)): a records request or written permission may replace
+or complement API collection.
+
+---
+
 ## Command reference
 
 Global options (before the subcommand):
@@ -458,6 +577,7 @@ Global options (before the subcommand):
 | `export` | `--out FILE.csv` |
 | `status` | Counts by status, days searched, top errors. |
 | `remaining --from --to` | Prints days not searched + tickets not finished for this shard (0 = done). |
+| `wait-maintenance` | Sleeps through an announced portal outage (`--max-minutes` caps the wait). |
 | `backup --to FILE.db` | Consistent copy while running (temp file + rename). |
 | `merge SHARD.db ...` | Combine shard databases into `--data-dir`. |
 

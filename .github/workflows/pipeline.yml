@@ -49,7 +49,7 @@ jobs:
     timeout-minutes: 350
     env:
       K: ${{ matrix.shard }}
-      ARTIFACT: state-shard-${{ matrix.shard }}-of-${{ env.TOTAL_SHARDS }}
+      ARTIFACT: state-shard-${{ matrix.shard }}-of-4   # keep in step with TOTAL_SHARDS
     steps:
       - uses: actions/checkout@v4
 

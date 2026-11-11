@@ -6,8 +6,8 @@ geocodes it to a **census tract**. The goal is to test whether parking enforceme
 across demographically distinct neighborhoods.
 
 The court's search API returns citations but not where they were written; the location exists only on
-the ticket itself, a PDF attached to each case. So the pipeline has to download one document per ticket,
-which is what makes this a multi-day, multi-machine job.
+the ticket itself, a PDF attached to each case. So the pipeline downloads one document per ticket, about
+2 million of them, which is what makes this a multi-day job.
 
 ---
 
@@ -15,39 +15,48 @@ which is what makes this a multi-day, multi-machine job.
 
 1. [Quick start](#quick-start)
 2. [Repository layout](#repository-layout)
-3. [How the pipeline works](#how-the-pipeline-works)
-4. [The data source](#the-data-source)
-5. [Ticket formats](#ticket-formats)
-6. [Database schema](#database-schema)
-7. [Exported CSV](#exported-csv)
-8. [Running at scale: shards](#running-at-scale-shards)
-9. [Runner: GitHub Actions](#runner-github-actions-shards-0-and-1)
-10. [Runner: Windows PC](#runner-windows-pc)
-11. [Runner: Linux host without root](#runner-linux-host-without-root-shard-3-ovid12)
-12. [Combining shards and exporting](#combining-shards-and-exporting)
-13. [Rate limiting and server courtesy](#rate-limiting-and-server-courtesy)
-14. [API limits: research and observations](#api-limits-research-and-observations)
-15. [Performance](#performance)
-16. [Known data gaps and caveats](#known-data-gaps-and-caveats)
-17. [Notes for the analysis](#notes-for-the-analysis)
-18. [Next phase: month work units](#next-phase-month-work-units)
-19. [Command reference](#command-reference)
-20. [Troubleshooting](#troubleshooting)
+3. [Architecture](#architecture)
+4. [Running it on GitHub Actions](#running-it-on-github-actions)
+5. [Getting the results: sync, merge, export](#getting-the-results-sync-merge-export)
+6. [Ticket images](#ticket-images)
+7. [The data source](#the-data-source)
+8. [Ticket formats](#ticket-formats)
+9. [Database schema](#database-schema)
+10. [Exported CSV](#exported-csv)
+11. [Rate limiting and server courtesy](#rate-limiting-and-server-courtesy)
+12. [API limits: research and observations](#api-limits-research-and-observations)
+13. [Performance](#performance)
+14. [Known data gaps and caveats](#known-data-gaps-and-caveats)
+15. [Notes for the analysis](#notes-for-the-analysis)
+16. [Design history](#design-history)
+17. [Ideas not yet built](#ideas-not-yet-built)
+18. [Command reference](#command-reference)
+19. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Quick start
 
+The full collection runs on GitHub Actions:
+
+```powershell
+gh workflow run index.yml -R llayman12/smc_parking_citation     # build the index, then start the buckets
+.\sync_results.ps1 -Merge                                       # any time: pull results, merge, export CSV
+```
+
+A small local run, end to end (Windows):
+
 ```powershell
 python -m pip install -r requirements.txt
-winget install UB-Mannheim.TesseractOCR          # Tesseract OCR (Windows)
+winget install UB-Mannheim.TesseractOCR
 
-# one week, end to end, into .\data
-python parking_pipeline.py search --from 2025-11-03 --to 2025-11-09
-python parking_pipeline.py fetch --ocr --delete-images
-python parking_pipeline.py geocode
-python parking_pipeline.py export --out parking_citations.csv
-python parking_pipeline.py status
+python parking_pipeline.py search    --from 2025-11-03 --to 2025-11-09      # citations, by violation day
+python parking_pipeline.py list-docs --from 2025-11-03 --to 2025-11-20      # ticket documents, by filing day
+python parking_pipeline.py build-index --buckets 16
+python parking_pipeline.py --data-dir b0 take-bucket --index data\parking.db --bucket 0
+python parking_pipeline.py --data-dir b0 fetch --ocr
+python parking_pipeline.py --data-dir b0 geocode
+python parking_pipeline.py --data-dir b0 export --out parking_citations.csv
 ```
 
 Every stage is resumable: rerunning skips days already searched and tickets already fetched.
@@ -58,48 +67,181 @@ Every stage is resumable: rerunning skips days already searched and tickets alre
 
 | Path | Purpose |
 |---|---|
-| `parking_pipeline.py` | The whole pipeline: search, fetch, OCR, geocode, export, plus shard tools (`remaining`, `backup`, `merge`). |
-| `run_shard.ps1` | Runs one shard to completion on a Windows machine, in hourly chunks. |
-| `linux/setup.sh` | Installs Python 3.12 + Tesseract with micromamba on a Linux host without root, outside the home quota. |
-| `linux/run_shard.sh` | Bash equivalent of `run_shard.ps1`, with compressed hourly backups. |
-| `.github/workflows/pipeline.yml` | Runs shards 0 and 1 on GitHub Actions in ~5-hour chunks that chain themselves. |
+| `parking_pipeline.py` | The whole pipeline: `search`, `list-docs`, `build-index`, `take-bucket`, `fetch`, `ocr`, `geocode`, `export`, plus `merge`, `status`, `remaining` and other helpers. |
+| `.github/workflows/index.yml` | Step 1: builds the index (all citations joined to their ticket documents, split into 256 buckets). |
+| `.github/workflows/buckets.yml` | Step 2: downloads and OCRs the tickets, one bucket per job, several jobs at a time. |
+| `sync_results.ps1` | Pulls finished bucket databases and ticket images from GitHub to the PC and OneDrive; optionally merges, geocodes and exports. |
 | `requirements.txt` | `requests`, `pypdf`, `pillow`, `pytesseract`. |
 | `archive/` | Earlier prototype scripts and scrapes. Local only (git-ignored). |
 
 ---
 
-## How the pipeline works
+## Architecture
 
 ```
- search ──► citations table (status=new)
-               │
- fetch  ──► find ticket PDF ─► download ─► keep page-1 image (status=fetched)
-               │                              │
-               │                         --ocr: OCR immediately
- ocr    ──► Tesseract ─► parse fields ─► (status=ocr, ticket_format=printed|handwritten)
-               │
- geocode ─► Census batch geocoder ─► geocodes table (lat/lon, tract)
-               │
- export ──► CSV (citations ⨝ geocodes)
+index.yml                                   buckets.yml                          your PC
+─────────                                   ───────────                          ───────
+search     citations by violation day ─┐    plan: which buckets have no          sync_results.ps1
+list-docs  ticket PDFs by filing day ──┤          "done-NNN" artifact yet?         ├─ done-NNN  → C:\SMCData\buckets
+merge + build-index                    │    work (N jobs at a time):               │            → OneDrive\SMCData\db
+   join on case, assign buckets ───────┴─►    take-bucket → fetch + OCR            ├─ images-NNN → OneDrive\SMCData\images
+   "index" artifact                           upload done-NNN + images-NNN ──────► └─ -Merge: merge → geocode → export CSV
 ```
 
-| Stage | What it does | Requests per unit |
-|---|---|---|
-| `search` | For each day (Seattle local time) pages through the citation search, 500 per page, and records parking citations. A day is marked done only when every page is in and the count matches the server's total. Days run in parallel. | ~3–5 per day |
-| `fetch` | Lists the case's documents, picks the ticket PDF, downloads it, keeps the largest image on page 1 as a grayscale PNG and discards the rest (vehicle photos, certification pages). With `--ocr` the image is OCR'd as soon as it lands; with `--delete-images` it is deleted afterwards. | 2 per ticket |
-| `ocr` | Tesseract (`--psm 4`) on each image, then regex parsing of the printed fields. Tickets without a location label are flagged `handwritten`. Legacy 400-px-wide receipts are upscaled 2× first. | none (CPU only) |
-| `geocode` | Sends each distinct location string to the U.S. Census batch geocoder (1,000 per request) and stores lon/lat, state/county/tract/block FIPS and the 11-digit tract GEOID. Handles intersections such as `3RD AVE & PINE ST`. | 1 per 1,000 locations |
-| `export` | One row per OCR'd citation with its geocode joined on. | none |
+### The index
 
-Statuses in the `citations` table:
+Two cheap listings, each a few requests per day of data, describe all the work before any ticket is downloaded:
+
+| Listing | Endpoint | Keyed by | Gives |
+|---|---|---|---|
+| `search` | `/courts/cms/citations` | violation day | citation number, case, violation time, citing agency |
+| `list-docs` | `/courts/cms/docketentrydocuments`, filtered to docket entry sub type `1001507` ("Complaint - Parking Citation") | docket-entry filing day | the ticket PDF's ID (`documentLinkUUID`) and its case |
+
+`build-index` joins them on the case. The result is one row per citation with the ID of its ticket PDF:
+
+- **One request per ticket.** `fetch` goes straight to the download. (The first design looked up each
+  case's documents first: two requests per ticket.)
+- **Missing documents are known up front.** A citation whose case has no parking-citation document is
+  marked `no_doc` in the index and never requested. See [Known data gaps](#known-data-gaps-and-caveats).
+- Documents are listed through *today*, not just through the last violation day, because a ticket's
+  document can be filed days after the violation.
+
+### Buckets: every unit is a random sample
+
+`build-index` assigns each citation to one of **256 buckets** by a hash of its citation number
+(`sha1(number) mod 256`). Consequences:
+
+- Each bucket is a **uniform random sample** of the whole 2020–2026 range, about 0.4% of all tickets
+  (roughly 9,000).
+- **Any set of finished buckets is itself a uniform random sample.** After 26 buckets you hold a 10%
+  sample of every month and every neighborhood, and analysis can start. Stopping early costs precision,
+  not coverage.
+- Inside a bucket, tickets are fetched in random order too (`ORDER BY case_uuid`; the IDs are random UUIDs).
+- Buckets are independent. Any worker can do any bucket, in any order, with no coordination beyond
+  "is there a `done-NNN` yet?".
+
+### Workers
+
+One GitHub job does one bucket: download the index, `take-bucket`, `fetch --ocr` (download each PDF, keep
+the page-1 image, OCR it immediately), upload the bucket database and its images. A finished bucket is the
+checkpoint, so at most one bucket's work is ever at risk. A job that runs out of time, or meets an
+announced portal outage, uploads `part-NNN` instead; the next run resumes it.
+
+### Statuses in the `citations` table
 
 | `status` | Meaning |
 |---|---|
-| `new` | Found by search, not yet fetched. |
-| `fetched` | Image downloaded, not yet OCR'd. |
+| `new` | In the index with a ticket document, not yet fetched. |
+| `fetched` | Image downloaded, not yet OCR'd (transient). |
 | `ocr` | OCR'd and parsed. Final state for usable tickets. |
-| `no_doc` | The case has no ticket PDF. `error` lists the documents it did have (for auditing). |
-| `error` | A request or PDF problem. Retried with `fetch --retry`. |
+| `no_doc` | The case has no parking-citation document in the court's listing. |
+| `error` | A request or PDF problem. Retried once at the end of the bucket (`fetch --retry-errors`). |
+
+---
+
+## Running it on GitHub Actions
+
+### 1. Build the index (`index.yml`, ~45 minutes)
+
+```powershell
+gh workflow run index.yml -R llayman12/smc_parking_citation
+```
+
+Four jobs each search a quarter of the days (`--shard K/4`) and list the documents filed on them; each
+repeats up to three passes until no day is missing, and fails if any still is. A merge job combines them,
+runs `build-index --buckets 256 --slim`, writes a year-by-year table of citations with and without
+documents to the run summary, uploads the **`index`** artifact (kept 90 days) and starts `buckets.yml`.
+
+Inputs: `from`, `to` (violation days), `interval`, `start_buckets`.
+
+### 2. Work the buckets (`buckets.yml`)
+
+Started by the index run, by hand, or by its 6-hourly backstop schedule:
+
+```powershell
+gh workflow run buckets.yml -R llayman12/smc_parking_citation                 # 4 workers, 3.3 req/s each
+gh workflow run buckets.yml -R llayman12/smc_parking_citation -f workers=6    # more sources of requests
+gh workflow run buckets.yml -R llayman12/smc_parking_citation -f smoke=true   # 2 buckets x 40 tickets
+```
+
+- **plan** lists buckets with no `done-NNN` artifact newer than the current index (results from an older
+  index don't count: its buckets were cut differently). During an announced portal outage it plans nothing.
+- **work** runs one job per planned bucket, `workers` at a time. Only one run of this workflow is active at
+  once; a second waits.
+- Re-dispatching is always safe: it plans whatever is still missing. That is also how failed buckets are
+  retried, and it is all the backstop schedule does.
+
+| Input | Default | |
+|---|---|---|
+| `workers` | 4 | Bucket jobs at once. Each is a separate source of requests to the court. |
+| `interval` | 0.3 | Seconds between requests per job. OCR on a 4-core runner is the slower stage, so a lower interval gains little. |
+| `smoke` | false | 2 buckets, 40 tickets each, left as `part-NNN`. Exercises every step in about 5 minutes. |
+
+Artifacts:
+
+| Name | Contents | Kept |
+|---|---|---|
+| `index` | The index database (gzipped) | 90 days |
+| `done-NNN` | A finished bucket's database (gzipped, ~2–3 MB) | 90 days |
+| `part-NNN` | An unfinished bucket's database, to resume from | 90 days |
+| `images-NNN` | The page-1 ticket images that job downloaded (~450 MB per bucket) | 30 days |
+| `index-part-K` | Intermediate index pieces | 7 days |
+
+GitHub is only a relay: **run `sync_results.ps1` at least every couple of weeks** while work is in progress,
+or images will expire before they are saved.
+
+Watch progress in the Actions tab (a running job's log streams live there), or:
+
+```powershell
+gh run list -R llayman12/smc_parking_citation -L 5
+```
+
+Each bucket job's summary shows its `status` counts.
+
+> The repository is public, so artifacts (ticket images and OCR text, which include plates and officer
+> names) can be downloaded by any signed-in GitHub user until they expire. The source is public court records.
+
+---
+
+## Getting the results: sync, merge, export
+
+```powershell
+.\sync_results.ps1            # download new bucket databases and image archives
+.\sync_results.ps1 -Merge     # ...then merge all finished buckets, geocode, export the CSV
+.\sync_results.ps1 -NoImages  # databases only
+```
+
+| What | Where |
+|---|---|
+| Bucket databases (working copies) | `C:\SMCData\buckets\done-NNN.db` |
+| Bucket databases (compressed copies) | `<OneDrive - UW>\SMCData\db\done-NNN.db.gz` |
+| Ticket images | `<OneDrive - UW>\SMCData\images\images-NNN-<id>.zip` |
+| Merged database | `C:\SMCData\all\parking.db` |
+| CSV | `C:\SMCData\parking_citations.csv` |
+
+The script skips anything already downloaded, and ignores results older than the current index. `-Merge`
+works on partial results and reports what fraction of the buckets (= what size random sample) it covers.
+Geocoding happens here, once, over the merged set, rather than in every worker.
+
+SQLite working files stay out of OneDrive on purpose: a sync client can corrupt a database that is being written.
+
+---
+
+## Ticket images
+
+Every downloaded ticket's page-1 image is kept, for auditing OCR results and for entering handwritten
+tickets by hand. Each is a grayscale PNG named `<citation number>.png` (current tickets ~55 KB, legacy
+receipts ~40 KB): about **115 GB** for all ~2 million.
+
+- GitHub can't hold them permanently (repository size limits; artifacts expire), so workers upload them as
+  30-day `images-NNN` artifacts and `sync_results.ps1` moves them to OneDrive as one zip per bucket job.
+  A few hundred large zips sync far better than millions of small files.
+- Each zip is marked online-only as soon as it is written, so OneDrive uploads it and then frees the local
+  disk. Check your OneDrive quota has ~115 GB free.
+- To find a ticket's image: its bucket is `bucket` in the database (or `sha1(citation number)[8:16] mod 256`);
+  open `images-NNN-*.zip` for that bucket.
+- A QA sample (suggested: 200 random tickets) can be checked by hand against the parsed fields to get a
+  real OCR error rate for the methods section.
 
 ---
 
@@ -111,44 +253,48 @@ Court ID: `68f021c4-6a44-4735-9a76-5360b2e8af13`
 | Endpoint | Used for |
 |---|---|
 | `GET /courts/cms/citations?violationDateFrom&violationDateTo&caseHeader.courtID&page&size&sort` | Day-by-day citation search. |
-| `GET /courts/cms/docketentrydocumentsaccess?caseHeader.courtID&caseHeader.caseInstanceUUID` | Every document on one case (no docket-entry ID needed). |
+| `GET /courts/cms/docketentrydocuments?docketEntryFiledDateFrom&docketEntryFiledDateTo&docketEntrySubTypeID&caseHeader.courtID&page&size&sort` | Day-by-day listing of parking-citation documents. |
 | `GET /courts/{court}/cms/case/{caseUUID}/docketentrydocuments/{documentLinkUUID}` | Download one document (PDF). |
+| `GET /courts/cms/docketentrydocumentsaccess?caseHeader.caseInstanceUUID` | Every document on one case. Only used by `fetch --retry` for rows without a document ID. |
 | `GET /courts/{court}/cms/cases/{caseUUID}` and `/charges` | Case classification and disposition (optional, `fetch --with-charges`). |
 
 Findings that shaped the design:
 
-- **The search ignores classification filters.** Parking is identified from the result itself: a
+- **The citation search ignores classification filters.** Parking is identified from the result itself: a
   **9-digit, all-numeric citation number** in the `Infraction` category. 13-digit numbers are traffic-camera
   tickets; `9A9999999`-style numbers are officer traffic tickets. Sampling case headers confirmed 12 of 12
   9-digit infractions were classified `Infraction - Parking & Traffic Camera - Parking`.
-- **9-digit `129…` numbers from Seattle Animal Control are not parking** (classified
-  `Infraction - Traffic - MCIS Legacy`) and are excluded by `citing_agency`.
-- **Do not filter on `closedFlag`.** About 70% of cases are closed; filtering to open cases loses most tickets.
-- **Use Seattle local time with the right UTC offset.** Day boundaries are built with
-  `America/Los_Angeles`, so PST/PDT changes are handled. A fixed `-07:00` shifts winter days by an hour.
-- **Search results include the citing agency** (`citingAgencyActorInstance`), stored as `citing_agency`.
-- **No rate-limit headers** are returned. Document downloads take the server several seconds each, so
-  document requests are the costly part.
-- **Range requests don't help.** The server honours byte ranges, but every request pays the same
-  multi-second server cost, so fetching only page 1 in pieces was 5–10× slower than one full download.
-- The court-wide document listing ignores filters and caps at 10,000 results, so it can't replace
-  per-case lookups.
+- **9-digit `129…` numbers from Seattle Animal Control are not parking** and are excluded by `citing_agency`.
+- **The document listing does honour filters** on docket-entry filed date and sub type (but not on document
+  name). Sub type `1001507` is "Complaint - Parking Citation" in every year tested, 2020–2025.
+- **Paging needs an explicit, tie-free sort.** Without one, a 1,556-row listing came back with 10 rows
+  repeated and 10 missing. The document listing sorts by `documentLinkUUID`; the citation search sorts by
+  violation date *and* citation number (hundreds of tickets a day share a violation time).
+- **The court's data contains a few true duplicate rows** (e.g. citation number `0` twice on one case). The
+  completeness check therefore distinguishes a repeat within a page (real) from a repeat across pages
+  (paging shifted).
+- **Any listing is capped at 10,000 results**, so both listings go day by day; `list-docs` fails a day that
+  reaches the cap rather than silently truncating it.
+- **Do not filter on `closedFlag`.** About 70% of cases are closed.
+- **Use Seattle local time with the right UTC offset** for day boundaries (`America/Los_Angeles`).
+- **Range requests don't help.** The server honours byte ranges, but each request pays the same server
+  cost, so fetching only page 1 in pieces was 5–10× slower than one full download.
 
-No names, addresses of defendants, or full plate numbers are written to the structured columns. Note,
-however, that `ocr_text` holds the full OCR'd ticket text, which includes the plate, VIN and officer name.
-All of it comes from public court records.
+The structured columns hold no names and no plate numbers. `ocr_text` and the images hold the full
+ticket, which includes the plate, VIN and officer name. All of it comes from public court records.
 
 ---
 
 ## Ticket formats
 
-The ticket PDF is found by name, in this order:
+All of these are filed under the "Complaint - Parking Citation" docket entry; they differ in document name
+and layout:
 
 | Era / type | Citation numbers | Document name | Page 1 | Location label | Handled as |
 |---|---|---|---|---|---|
-| Current handheld e-ticket | `74x…` (e.g. `745…`) | the citation number | 2240×1096 printed ticket image, ~2 MB PDF, 7 pages | `INFRACTION LOCATION:` | `printed` |
+| Current handheld e-ticket (since ~March 2024) | `739…` and later | the citation number | 2240×1096 printed ticket image, ~2 MB PDF | `INFRACTION LOCATION:` | `printed` |
 | Current scanned paper ticket | `13x…`, `17x…` (~0.5%) | `Complaint - Parking Citation` | scan of a handwritten form | — | `handwritten` |
-| Legacy (migrated from MCIS, ~2020) e-ticket | `72x…` | `spd docs` | 400-px-wide printed receipt, ~450 KB PDF | `LOCATION:` | `printed` |
+| Legacy (migrated from MCIS, 2020–early 2024) e-ticket | `72x…`–`738…` | `spd docs` | 400-px-wide printed receipt, ~450 KB PDF | `LOCATION:` | `printed` |
 | Legacy scanned paper ticket | `173…` | `parkers` | 2552×3300 scan | — | `handwritten` |
 
 Fields parsed from printed tickets: violation text, SMC section, fine, infraction location, plate
@@ -160,17 +306,17 @@ OCR clean-ups:
 - **Slashed zeros** in the legacy receipt font OCR as `@` (`11.70.02@`, `@7:19`) and are mapped back to `0`.
 - `Public Comments` sometimes OCRs as `ublic Comments`; the parser allows for it.
 - A blank `State:` field no longer falls through to "State of Washington".
+- Legacy receipts are upscaled 2× before OCR.
 
 **Handwritten tickets** (`ticket_format = handwritten`) can't be read by Tesseract. Their parsed fields
-are left empty, and `doc_link_uuid` is kept so the image can be downloaded again for manual entry. They appear
-to be issued by police officers and may be tied to incidents, so check whether they cluster in particular
-areas before excluding them.
+are empty; enter them by hand from the saved images. They appear to be issued by police officers and may be
+tied to incidents, so check whether they cluster in particular areas before excluding them.
 
 ---
 
 ## Database schema
 
-SQLite, one file per shard (`<data-dir>/parking.db`).
+SQLite. The index, each bucket and the merged result all use the same schema (`parking.db`).
 
 ### `citations`
 
@@ -182,10 +328,11 @@ SQLite, one file per shard (`<data-dir>/parking.db`).
 | `filed_date` | search | |
 | `closed_at_search` | search | 1 if the case was closed when searched. |
 | `citing_agency` | search | e.g. `Seattle Police Department`, `Seattle Department of Transportation`, `Seattle Parks Department`. |
+| `doc_link_uuid` | build-index | The ticket PDF's ID. NULL = no document (`no_doc`). |
+| `bucket` | build-index | 0–255. |
 | `status`, `error`, `updated_at` | pipeline | See statuses above. |
-| `image_path` | fetch | Cleared when the image is deleted after OCR. |
-| `doc_link_uuid` | fetch | The ticket PDF's ID, for re-downloading. |
-| `case_classification`, `statute_number`, `statute_description`, `dispo_type`, `dispo_method` | fetch `--with-charges` | Optional; costs 2 more requests per ticket. |
+| `image_path` | fetch | Path on the machine that fetched it; the file name is `<citation_number>.png`. |
+| `case_classification`, `statute_number`, `statute_description`, `dispo_type`, `dispo_method` | fetch `--with-charges` | Optional; 2 more requests per ticket. |
 | `ticket_format` | ocr | `printed` or `handwritten`. |
 | `ocr_text` | ocr | Full OCR text (allows re-parsing without re-OCR: `ocr --reparse`). |
 | `violation`, `smc`, `fine` | ocr | e.g. `11.72.465 \| CURB RAMP`, `11.72.465`, `47.0`. |
@@ -195,20 +342,15 @@ SQLite, one file per shard (`<data-dir>/parking.db`).
 | `infraction_datetime` | ocr | As printed; incomplete on legacy tickets. Prefer `violation_date`. |
 | `public_comments` | ocr | Officer's comment, e.g. `PAY TO PARK 8AM - 10PM ...`. |
 
-### `geocodes`
+### Other tables
 
-`location` (PK, same string as `infraction_location`), `match` (`Match` / `No_Match` / `Tie`),
-`match_type`, `matched_address`, `lon`, `lat`, `state_fips`, `county_fips`, `tract`, `block`,
-`geoid_tract` (11-digit state+county+tract GEOID, joins directly to ACS tables).
-
-### `searched_days`
-
-`day`, `total` (all citations that day), `parking` (parking citations recorded). Useful for checking
-coverage and daily volumes.
-
-### `meta`
-
-`shard` = the `K/N` the database belongs to; the pipeline refuses to mix shards.
+| Table | Contents |
+|---|---|
+| `geocodes` | `location` (same string as `infraction_location`), `match` (`Match` / `No_Match` / `Tie`), `match_type`, `matched_address`, `lon`, `lat`, `state_fips`, `county_fips`, `tract`, `block`, `geoid_tract` (11-digit GEOID, joins directly to ACS tables). |
+| `searched_days` | `day`, `total` (all citations that day), `parking` (parking citations recorded). |
+| `documents`, `listed_days` | The parking-citation document listing and which filing days are covered. Emptied from the published index (`--slim`); present in `index-part-K`. |
+| `latency_log` | One row per minute of requests: `minute` (Seattle time), `requests`, `total_latency`, `max_latency`, `failures`, `rate_cap`. For measuring server capacity from real runs. |
+| `meta` | `buckets`, `bucket`, `shard`. |
 
 ---
 
@@ -225,186 +367,30 @@ geocode_match, matched_address, lat, lon, geoid_tract`
 
 ---
 
-## Running at scale: shards
-
-About 2 million tickets need two requests each. To finish in days rather than weeks, the date range is
-split into **4 shards by day**: shard `K` takes every day whose ordinal satisfies `day.toordinal() % 4 == K`.
-Each shard searches and fetches only its own days, has its own database and its own rate limit, and never
-touches another shard's tickets, so the machines need no coordination. Interleaving days (rather than
-giving each machine a block of years) spreads every year across all four, so all years fill in together.
-
-| Shard | Runs on | Database lives | Backup |
-|---|---|---|---|
-| 0 | GitHub Actions | runner disk | `state-shard-0-of-4` artifact (3-day retention, replaced every run) |
-| 1 | GitHub Actions | runner disk | `state-shard-1-of-4` artifact |
-| 2 | GitHub Actions (moved from the Windows PC on 2026-11-10, started from the `seed` release) | runner disk | `state-shard-2-of-4` artifact |
-| 3 | UW Linux host `ovid12` | `/var/tmp/smc-llayman/shard-3-of-4` | `~/smc_backup/parking-shard-3-of-4.db.gz`, hourly |
-
-**Moving a shard to GitHub.** Stop it where it runs, snapshot and compress its database, and attach it to
-the `seed` release; the workflow restores a shard from `seed` only when it has no state artifact yet:
-
-```powershell
-python parking_pipeline.py --data-dir C:\SMCData\shard-2-of-4 backup --to C:\SMCData\seed\parking-shard-2-of-4.db
-python -c "import gzip,shutil; shutil.copyfileobj(open(r'C:\SMCData\seed\parking-shard-2-of-4.db','rb'), gzip.open(r'C:\SMCData\seed\parking-shard-2-of-4.db.gz','wb'))"
-gh release create seed C:\SMCData\seed\parking-shard-2-of-4.db.gz -R llayman12/smc_parking_citation --title "Seed databases" --notes "Starting databases for shards moved to GitHub Actions."
-gh workflow run pipeline.yml -R llayman12/smc_parking_citation -f shards="[2]"
-```
-
-Never run the same shard in two places at once: both would fetch the same tickets and their databases
-would diverge. The retired local copy is renamed `C:\SMCData\shard-2-of-4.moved-to-github`.
-
-All shards cover **2020-01-01 to 2026-10-31**. To change the shard count, every shard must start over
-with fresh databases (a database is locked to its `K/N`).
-
----
-
-## Runner: GitHub Actions (shards 0 and 1)
-
-`.github/workflows/pipeline.yml`:
-
-- A matrix job per shard. **Per-shard concurrency** means at most one job per shard at any time.
-- Each job: install Tesseract → **restore** the shard's latest `state-shard-K-of-4` artifact → search
-  (stops starting new days at 260 min) → fetch with inline OCR (stops at 280 min) → geocode (stops at
-  300 min) → write a status table to the run summary → **save** the database as a new artifact →
-  **queue the shard's next run** if `remaining` > 0.
-- The search/fetch step is `continue-on-error`, so progress is saved even if it fails. Saving is skipped
-  if restore failed, so an empty database can never overwrite real progress.
-- A schedule every 2 hours restarts any chain that broke.
-
-```powershell
-# start or restart
-gh workflow run pipeline.yml -R llayman12/smc_parking_citation -f shards="[0,1]"
-# one shard, at a lower rate
-gh workflow run pipeline.yml -R llayman12/smc_parking_citation -f shards="[1]" -f interval=0.333
-# final pass over errors and missing documents
-gh workflow run pipeline.yml -R llayman12/smc_parking_citation -f shards="[0,1]" -f retry=true
-# watch
-gh run list -R llayman12/smc_parking_citation -L 5
-```
-
-Each run's summary page shows the shard's `status` output. When a shard reports it is done, run it once
-with `retry=true`, then disable the workflow (Actions → parking-pipeline → ⋯ → Disable) so the backstop
-schedule stops.
-
-> The repository is public, so the state artifacts (including `ocr_text`) can be downloaded by any
-> signed-in GitHub user. The source data is public court records.
-
----
-
-## Runner: Windows PC
-
-Shard 2 ran here until it moved to GitHub on 2026-11-10. The script works for any shard on any Windows
-machine:
-
-```powershell
-.\run_shard.ps1 -Shard 2
-```
-
-Loops in 60-minute chunks: search → fetch with inline OCR and image deletion → geocode → optional backup
-→ check `remaining`, until the shard is done. Safe to stop with Ctrl-C and rerun.
-
-| Parameter | Default | |
-|---|---|---|
-| `-Shard` | (required) | |
-| `-Of` | 4 | |
-| `-DataDir` | `C:\SMCData\shard-K-of-4` | Keep it out of OneDrive: a sync client can corrupt a live SQLite file. |
-| `-BackupDir` | none | e.g. `"$env:OneDrive\SMCData"`. Hourly consistent copy, written to a temp name then renamed. |
-| `-Interval` | 0.2 | Seconds between requests (5/s). |
-| `-ChunkMinutes` | 60 | |
-
-The PC must stay awake (Settings → Power → Sleep: Never while plugged in).
-
----
-
-## Runner: Linux host without root (shard 3, ovid12)
-
-UW's `ovid12.u.washington.edu` is CentOS 7 with Python 3.8, no Tesseract, no root, an NFS home
-directory and a **1 GB home quota**. The setup therefore keeps everything large on local disk in
-`/var/tmp` (outside the quota and off NFS, where SQLite locking is unreliable):
-
-| What | Where | Size |
-|---|---|---|
-| Code | `~/smc_parking_citation` (git clone) | < 1 MB |
-| Python 3.12 + Tesseract 5.5 (micromamba) | `/var/tmp/smc-llayman/env` | ~650 MB |
-| Working database | `/var/tmp/smc-llayman/shard-3-of-4/parking.db` | grows to several hundred MB |
-| Hourly compressed backup | `~/smc_backup/parking-shard-3-of-4.db.gz` | ~¼ of the database |
-
-```bash
-# one-time (rerun if /var/tmp is ever wiped)
-git clone https://github.com/llayman12/smc_parking_citation.git ~/smc_parking_citation
-bash ~/smc_parking_citation/linux/setup.sh
-
-# start in a detached tmux session (survives logout)
-tmux new -d -s shard3 'bash ~/smc_parking_citation/linux/run_shard.sh 3'
-
-# check on it
-tmux attach -t shard3                  # Ctrl-B then D to detach
-tail -f /var/tmp/smc-llayman/shard-3-of-4/run.log
-```
-
-`run_shard.sh` runs the pipeline at `nice 19` with 4 OCR processes to stay polite on a shared host. If the
-working database is missing on start (e.g. `/var/tmp` was cleaned), it restores from the backup.
-Environment overrides: `BASE`, `BACKUP_DIR`, `FROM`, `TO`, `INTERVAL`, `CHUNK_MIN`, `OCR_WORKERS`.
-
-SSH from the Windows PC uses the `smc-runner` host alias in `~/.ssh/config` (key `~/.ssh/smc-runner`):
-
-```powershell
-ssh smc-runner
-scp smc-runner:smc_backup/parking-shard-3-of-4.db.gz C:\SMCData\
-```
-
----
-
-## Combining shards and exporting
-
-```powershell
-# 1. GitHub shards: download each latest artifact
-foreach ($k in 0, 1) {
-  $id = gh api "repos/llayman12/smc_parking_citation/actions/artifacts?name=state-shard-$k-of-4&per_page=1" -q '.artifacts[0].workflow_run.id'
-  gh run download $id -n "state-shard-$k-of-4" -D "C:\SMCData\gh$k" -R llayman12/smc_parking_citation
-  python -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" "C:\SMCData\gh$k\parking.db.gz" "C:\SMCData\gh$k\parking.db"
-}
-
-# 2. ovid12 shard
-scp smc-runner:smc_backup/parking-shard-3-of-4.db.gz C:\SMCData\uw\
-python -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" C:\SMCData\uw\parking-shard-3-of-4.db.gz C:\SMCData\uw\parking.db
-
-# 3. merge and export
-python parking_pipeline.py --data-dir C:\SMCData\all merge C:\SMCData\gh0\parking.db C:\SMCData\gh1\parking.db C:\SMCData\shard-2-of-4\parking.db C:\SMCData\uw\parking.db
-python parking_pipeline.py --data-dir C:\SMCData\all export --out C:\SMCData\parking_citations.csv
-```
-
-`merge` can be run at any time on partial shards to look at progress; rerunning it with newer copies
-replaces older rows.
-
----
-
 ## Rate limiting and server courtesy
 
 All requests from one process go through a shared `Client`:
 
-- **Spacing.** Request *starts* are at least `--interval` seconds apart across all worker threads
-  (default 0.2 s = 5 requests/second per shard), however many workers run.
+- **Spacing.** Request *starts* are about `--interval` seconds apart across all worker threads, with ±20%
+  random jitter so several machines don't fall into step.
 - **Errors halve the rate.** Any HTTP 429, 5xx, timeout or connection error doubles the interval (up to
   10 s) and pauses every worker for 5 s, 15 s, 45 s, 135 s on successive attempts (4 retries).
-- **Slow responses also cut the rate.** If the smoothed response time rises above 10 s, the interval
-  grows 1.5× (at most once a minute) before the server starts failing.
-- **Recovery.** After 200 clean responses in a row (and with latency back below 5 s), the rate rises 10% at a
-  time back to `--interval`.
-- Fetch prints the current rate, average latency and failure count every 100 tickets. Rising latency is the
-  signal to lower `--interval` or `--workers`.
-
-- **Silent bad responses.** Under strain the server has answered `200 OK` with *empty* document lists. A run
-  of 15 "no documents at all" results triggers a recheck of the last 3 cases after 30 s; if documents appear
-  now, the run is re-queued and the rate halved. If they are still empty (some periods genuinely have no
-  ticket documents) the run is accepted.
+- **Slow responses cut the rate.** If the smoothed response time rises above 6 s, the interval grows 1.5×
+  (at most every 30 s), before the server starts failing.
+- **Recovery in minutes.** After 30 clean responses in a row, with latency back under 3 s, the interval
+  shrinks 15% toward `--interval`. (The first version needed 200 responses per 10% step: over an hour to
+  recover from a deep cut.)
+- **OCR backpressure.** Fetching pauses when 25 images per OCR process are waiting, so downloads never
+  outrun OCR.
 - **Announced outages.** `MAINTENANCE_WINDOWS` in `parking_pipeline.py` lists portal maintenance windows
-  (Seattle time). No requests are made inside one; runners sleep through it (`wait-maintenance`), and GitHub
-  jobs wait up to 270 minutes, then save and requeue. Add new windows as the court announces them on its
+  (Seattle time). No requests are made inside one: running jobs stop and save, and the planner plans
+  nothing until it is over. Add new windows as the court announces them on its
   [public records page](https://seattle.gov/courts/programs-and-services/public-records-requests).
+- **Empty-response check** (only for `fetch --retry`, which looks cases up one by one): a run of 15 "no
+  documents at all" answers is rechecked before being believed.
 
-See [API limits: research and observations](#api-limits-research-and-observations) for what is known about
-the server's capacity.
+With the defaults the court sees at most 4 sources × 3.3 requests/second, and usually less, because OCR is
+the slower stage.
 
 ---
 
@@ -415,82 +401,93 @@ the server's capacity.
 - **Software.** The court's case management system is Thomson Reuters **C-Track** (with **cFive** for
   probation), which replaced the legacy MCIS system around March 2024 ([SMC technology page](https://seattle.gov/courts/about/technology)).
   Pre-2024 cases were migrated, which is why older tickets have different document names and layouts.
-  The portal API (`courtrecords-api.seattle.gov`) is a Spring Boot service; it publishes an OpenAPI 3
-  description at `/v3/api-docs` titled "Public Portal APIs" (238 paths).
+  The portal API is a Spring Boot service; it publishes an OpenAPI 3 description at `/v3/api-docs` titled
+  "Public Portal APIs" (238 paths). That description is where the filterable document listing was found.
 - **No published limits.** The OpenAPI description defines no security scheme and says nothing about rate
-  limits, quotas or acceptable use. Responses carry no rate-limit headers (`X-RateLimit-*`, `Retry-After`),
-  only standard security headers. The portal's public configuration endpoints (`/features`, `/courts`,
-  `/quicklinks`, `/announcements`) contain no usage terms. The admin `actuator` endpoints listed in the
-  OpenAPI description were deliberately not queried.
-- **Court policy on bulk data.** The court's public records page states: "Requests for court data or bulk
-  court records from the court's case management system must be submitted through our Public Records
-  Portal" (`smc-seattle.mycusthelp.com`), and cites General Rule 31 (Access to Court Records) and JISCR 15
-  (Data Dissemination). It says nothing specific about automated use of the online portal. **Consider this
-  before publishing or repeating the collection**: a records request, or written permission for API use,
-  would put the dataset on firmer footing.
+  limits, quotas or acceptable use. Responses carry no rate-limit headers. The portal's public
+  configuration endpoints contain no usage terms. The admin `actuator` endpoints listed in the description
+  were deliberately not queried.
+- **Court policy.** The court's public records page says requests for "court data or bulk court records from
+  the court's case management system" go through its Public Records Portal, and cites General Rule 31 and
+  JISCR 15. It says nothing specific about automated use of the online portal.
 
-### What the pipeline has observed
+### What has been observed
 
 | When (Seattle time) | Load | What happened |
 |---|---|---|
 | Nov 4–10 tests | 1–5 req/s from one source | No errors, latency 0.3–4 s. |
-| 2026-11-10 ~22:13 | ~10 req/s from **one IP** (a shard plus a test run on the same PC) | 217 cases in one minute came back `200 OK` with **empty document lists** (false "no document"). Other machines did not see it. Suggests a silent per-source limit or overload that returns empty results instead of errors. |
-| 2026-11-10 ~22:15–22:35 | ~20 req/s total from 4 sources | **Server-wide slowdown:** average latency rose from ~1 s to 10–40 s on two different machines at the same time, with no HTTP errors. The latency guard cut each shard from 5 to 0.3 req/s; latency returned to 0.3 s by 22:38. |
+| 2026-11-10 ~22:13 | ~10 req/s from one IP | 217 per-case document lookups in one minute came back `200 OK` with **empty lists**. |
+| 2026-11-10 ~22:15–22:35 | ~20 req/s total from 4 sources | Latency rose from ~1 s to 10–40 s on two machines at once, with no HTTP errors; back to 0.3 s by 22:38. |
 
-Working conclusions:
-- **Per source:** stay at ≤ 5 req/s. ~10 req/s from one IP produced silently wrong answers.
-- **Total:** ~20 req/s across all sources is at or near what the server tolerates at night. More sources
-  or higher rates are likely to slow the portal for the public and to return bad data.
-- **No stress-testing.** Deliberately ramping requests until the server fails was considered and rejected:
-  the server already showed strain at current load, the failure mode is silent bad data rather than clean
-  429s, and the portal serves the public. Limits are instead measured passively from production logs: the
-  `-- ... req/s cap, avg latency ...` progress lines and `! server slowing` / `! re-queued` events.
+**These are one evening's events and prove little.** Both happened in the same 20 minutes, so they may be
+one cause, and that cause may be the court's own nightly processing rather than this project's load. They
+are not a measured ceiling.
+
+### How limits are measured now
+
+Deliberately ramping requests until the server fails was rejected: the failure mode seen so far is slow or
+silently wrong answers on a public portal, not clean 429s. Instead every run records `latency_log`. After
+merging, compare latency by hour of day against the request rate the project was sending:
+
+```sql
+SELECT substr(minute, 12, 2) AS hour, SUM(requests) AS requests,
+       ROUND(SUM(total_latency) / SUM(requests), 2) AS avg_latency, ROUND(MAX(max_latency), 1) AS worst,
+       SUM(failures) AS failures
+FROM latency_log GROUP BY 1 ORDER BY 1;
+```
+
+If latency tracks the clock rather than the project's own rate, the slow periods are the court's, and
+`workers` can be raised outside them. If it tracks the rate, the ceiling is real.
 
 ---
 
 ## Performance
 
-Measured, per shard at 5 requests/second:
+| Stage | Throughput | Basis |
+|---|---|---|
+| Index (search + document listing, all days) | ~45 min, ~20,000 requests | 4 jobs at 5 req/s; search measured at ~19 days/minute per source |
+| Fetch | 1 request per ticket; up to ~12,000/hour per worker at 3.3 req/s | measured ~10,800/hour locally |
+| OCR | ~1.3 CPU-seconds per ticket → ~11,000/hour on 4 cores | measured on the PC; GitHub runners may be slower |
+| All ~2 million tickets, 4 workers | roughly 2–3 days | estimate; OCR-bound |
 
-| Stage | Throughput |
-|---|---|
-| Search | ~19 days/minute (a full year in ~20 min) |
-| Fetch | up to 9,000 tickets/hour (2 requests each); ~5,400/hour observed at 3 req/s |
-| OCR | ~1.3 CPU-seconds per ticket with one Tesseract thread per process → ~11,000/hour on 4 cores |
+Compared with the first design (two requests per ticket, four sources at 5 req/s): about the same wall
+time for **half the requests** to the court.
 
 Tesseract is limited to one thread per process (`OMP_THREAD_LIMIT=1`). Running many processes that each
 start their own thread pool oversubscribed the CPU: 6.3 vs 1.3 CPU-seconds per ticket.
 
-Volume: 279,378 parking citations in 2020; weekdays typically see 1,000–1,600. Roughly 2 million tickets
-for 2020–October 2026, about 3–4 days of wall time across four shards.
+Volume: 279,378 parking citations in 2020; weekdays typically see 1,000–1,600.
 
 ---
 
 ## Known data gaps and caveats
 
-- **Cases with no ticket document.** Some cases have no ticket PDF at all. In a January 2024 sample, 27 of
-  28 cases had only `Declaration - Officers Comments` / `Officers Notes` docket entries (comment text, no
-  location). June 2024 was complete. These are kept as `no_doc`. Measure the gap by month before analysis:
+- **Citations with no ticket document.** Some cases have no parking-citation document at all, so their
+  location can't be recovered from the API. On 2024-01-05, 1,247 of 1,258 citations had none (the court
+  switched case management systems in early 2024); on test days in March 2020 and June 2025 it was 3% and
+  0.2%. The index run's summary shows the count per year, and they stay in the data as `no_doc`:
   ```sql
   SELECT substr(violation_date,1,7) AS month, status, COUNT(*) FROM citations GROUP BY 1, 2;
   ```
-- **False "no document" results.** Before the circuit breaker existed, a burst of empty server responses
-  (2026-11-10 ~22:13) marked 239 shard-2 tickets `no_doc`; they were reset to `new` in the seed. Other
-  shards may hold a few such rows. The final `retry=true` / `fetch --retry` pass rechecks every `no_doc`.
+  Treat months with a large gap as missing, not as low enforcement.
 - **Geocoding misses.** About 2–3% of distinct printed locations returned `No_Match` from the Census
   geocoder even though they look valid (e.g. `1222 HARBOR AVE SW`). A second geocoder could recover them.
 - **Handwritten tickets** (~0.5%) have no parsed fields and need manual entry. They may not be a random subset.
 - **OCR errors** remain in some fields (e.g. `11.76.0015` for `11.76.015`). `violation` and `smc` carry the
-  same section, so they can cross-check each other. `infraction_location` is checked by the geocoder.
+  same section, so they can cross-check each other. `infraction_location` is checked by the geocoder, but a
+  misread that is still a valid address passes; hence the QA sample.
 - **`infraction_datetime`** is incomplete on legacy tickets. Use `violation_date` (UTC) and convert to
   Seattle time.
-- **Snapshot in time.** `closed_at_search` and late-filed documents reflect when the shard searched.
-  Running `fetch --retry` later can pick up documents filed after the first pass.
+- **Snapshot in time.** The index reflects the day it was built: `closed_at_search`, and documents filed
+  later, are not updated. Rebuild the index to refresh (finished buckets from the old index then no
+  longer count).
 
 ---
 
 ## Notes for the analysis
 
+- **Partial data is usable.** Finished buckets are a uniform random sample. Weight counts by
+  256 / (buckets merged) to estimate totals.
 - **Complaint-driven vs patrol-driven.** Public comments such as `CSR COMPLAINT` mark tickets written in
   response to a resident complaint. Those measure resident behaviour as much as enforcement, so analyse them
   separately.
@@ -500,60 +497,36 @@ for 2020–October 2026, about 3–4 days of wall time across four shards.
 - **Demographics.** Join `geoid_tract` to American Community Survey (ACS) 5-year tract tables.
 - **Ticket mix.** Compare violation types (`smc`), fines and officers (`officer_id`) across tracts, not just
   totals.
-- **Time.** Volumes changed sharply in 2020 (COVID-era enforcement changes are visible in `searched_days`).
-  Check `citing_agency` and daily volumes over time before pooling years.
+- **Time.** Volumes changed sharply in 2020. Check `citing_agency` and daily volumes (`searched_days`) over
+  time before pooling years.
 - If the work is published through UW, check with the UW Human Subjects Division (IRB) about whether review
   is needed.
 
 ---
 
-## Next phase: month work units
+## Design history
 
-The current run uses **static day shards**: each machine owns a fixed quarter of the days. It works, but it
-showed its limits during this run:
+| Version | Design | Why it was replaced |
+|---|---|---|
+| 1 (Nov 10) | One machine, year by year: search → fetch → OCR → geocode. | ~40 days for the full range. |
+| 2 (Nov 10) | Four static day-shards (`--shard K/4`) on GitHub ×2, a PC and a UW Linux host; each fetched oldest-first with two requests per ticket and carried one growing database between 5-hour GitHub runs. | A stopped machine stalled its quarter; partial results were "the oldest tickets"; 5-hour checkpoints; two requests per ticket; three kinds of runner to maintain. Ran for about two hours (~40,000 tickets) and was discarded. |
+| 3 (current) | Index first, then 256 random buckets, one request per ticket, GitHub only, images kept. | |
 
-- one machine stopping stalls its whole quarter (the reason shard 2 had to move to GitHub);
-- the finish waits for the slowest shard;
-- changing the number of machines means starting over;
-- each GitHub shard re-uploads one ever-growing database every run, and it is lost if a chain stays
-  broken longer than the artifact retention.
+`--shard K/N` survives only as the way the index build splits days across four jobs.
 
-For the next collection (e.g. extending the data each year, or a re-run), switch to **dynamic assignment of
-month-sized work units**. Throughput is the same (it is set by sources × rate, see
-[API limits](#api-limits-research-and-observations)); what changes is flexibility and durability.
+---
 
-### Design
+## Ideas not yet built
 
-| Piece | Design |
-|---|---|
-| Unit of work | One calendar month. ~28,000 tickets ≈ 3 h of fetch + OCR at 9,000/hour, so **one 6-hour GitHub job finishes one month**, search included (~2 min). 2020-01 … 2026-10 = 82 units. Split a month in halves if any exceeds ~40,000 tickets. |
-| Result of a unit | A small, finished SQLite database (`parking-YYYY-MM.db.gz`, ~15 MB), attached to a GitHub **release** (`months`). Release assets don't expire, so finished work is permanent. |
-| What's done | The list of assets on the `months` release. |
-| Claims | Before starting a month, a worker pushes the Git tag `claim/YYYY-MM`. Tag creation is atomic: if it already exists, another worker has it, so pick the next month. The claim records the worker and time; a claim older than 8 hours with no asset is stale and may be deleted and retaken. |
-| Planner | A small GitHub job (on dispatch and every 2 h) lists months with neither an asset nor a live claim and starts a matrix of up to N workers (N = 4 by default, the total-load ceiling). |
-| Worker | `parking_pipeline.py work-month --month YYYY-MM`: search the month's days → fetch with inline OCR → geocode → upload the asset → delete the claim. Same code on GitHub, a PC or ovid12; a non-GitHub worker just loops "claim next month → work → upload". |
-| Stopping a machine | Its claim goes stale and the month is retaken from scratch. At most one month (~3 h) of work is lost. |
-| Retries | `fetch --retry` per month: reopen a month, retry its `error`/`no_doc` rows, re-upload. |
-| Final dataset | `merge` all `parking-*.db.gz` assets, then `export`. |
-| Rate limits | Unchanged: ≤ 5 req/s per worker, ≤ 4 workers at once, latency guard, empty-response breaker, maintenance windows. |
-
-### Transition steps
-
-1. Finish the current shard run (all four `remaining` = 0, one `retry=true` pass) and merge it. This is the
-   2020-01 … 2026-10 baseline.
-2. Add `--month YYYY-MM` (sets `--from/--to` to that month) and a `work-month` command that wraps search → fetch
-   → geocode → upload, plus `claim`/`release` helpers using `git push origin refs/tags/claim/YYYY-MM`.
-3. Add `.github/workflows/months.yml` (planner + worker matrix, `contents: write` permission for tags and
-   release assets). Retire `pipeline.yml`'s shard matrix.
-4. Add `run_months.ps1` / `linux/run_months.sh` loops for non-GitHub workers.
-5. Optionally split the baseline into month assets (`merge` already handles any set of databases), so
-   future months append to the same `months` release.
-6. Each new month: dispatch the planner after the month ends (plus a few weeks for late filings); it will
-   find one unclaimed unit and run it.
-
-Before the next phase, weigh the court's stated channel for bulk data (see
-[API limits](#api-limits-research-and-observations)): a records request or written permission may replace
-or complement API collection.
+- **Hourly rate schedule.** Once `latency_log` shows which hours have headroom, vary `workers` or the
+  interval by time of day.
+- **Second geocoder** for the ~2–3% of addresses the Census geocoder misses (King County or Seattle
+  address points).
+- **Incremental updates.** For new months, build an index for just that date range and run its buckets; the
+  merge already combines any set of bucket databases. Keep bucket counts small for small ranges.
+- **Non-GitHub workers.** A PC or server could work buckets too, but it would need a GitHub token to upload
+  results and a claim step so two machines don't take the same bucket.
+- **Manual entry tool** for handwritten tickets, working from the saved images.
 
 ---
 
@@ -564,22 +537,26 @@ Global options (before the subcommand):
 | Option | Default | |
 |---|---|---|
 | `--data-dir` | `data` | Folder holding `parking.db` and `tickets/`. |
-| `--interval` | 0.2 | Minimum seconds between requests (5/s). Adapts automatically. |
-| `--shard K/N` | `0/1` | Only days with ordinal % N == K. |
+| `--interval` | 0.2 | Seconds between requests (5/s). Adapts automatically. |
+| `--shard K/N` | `0/1` | `search` / `list-docs`: only days with ordinal % N == K. |
 | `--stop-at` | none | Unix time after which search/fetch/geocode start no new work. |
 
 | Command | Options |
 |---|---|
-| `search --from YYYY-MM-DD --to YYYY-MM-DD` | `--workers 4` (days in parallel), `--sample 0.05` (deterministic fraction of tickets), `--redo` |
-| `fetch` | `--workers 16`, `--ocr`, `--ocr-workers N`, `--delete-images [printed\|all]`, `--retry`, `--limit N`, `--with-charges` |
+| `search --from --to` | Citations by violation day. `--workers 4`, `--sample 0.05`, `--redo` |
+| `list-docs --from --to` | Parking-citation documents by filing day. `--workers 4`, `--redo` |
+| `missing-days --from --to --docs-to` | Days not yet searched / listed for this shard (0 = complete). |
+| `build-index` | Join citations to documents, assign buckets. `--buckets 256`, `--slim` |
+| `take-bucket --index FILE --bucket N` | Copy one bucket's citations into `--data-dir` (or resume it). |
+| `fetch` | `--workers 16`, `--ocr`, `--ocr-workers N`, `--delete-images [printed\|all]`, `--retry-errors`, `--retry`, `--limit N`, `--with-charges` |
 | `ocr` | `--workers N`, `--delete-images [printed\|all]`, `--redo`, `--reparse` (re-parse stored text only) |
 | `geocode` | `--batch 1000` |
 | `export` | `--out FILE.csv` |
 | `status` | Counts by status, days searched, top errors. |
-| `remaining --from --to` | Prints days not searched + tickets not finished for this shard (0 = done). |
-| `wait-maintenance` | Sleeps through an announced portal outage (`--max-minutes` caps the wait). |
-| `backup --to FILE.db` | Consistent copy while running (temp file + rename). |
-| `merge SHARD.db ...` | Combine shard databases into `--data-dir`. |
+| `remaining` | Tickets not finished (0 = done). With `--from --to`, also this shard's unsearched days. |
+| `merge DB ...` | Combine databases into `--data-dir`. |
+| `backup --to FILE.db` | Consistent copy while running. |
+| `wait-maintenance` | Sleep through an announced portal outage (`--max-minutes` caps the wait). |
 
 ---
 
@@ -587,12 +564,13 @@ Global options (before the subcommand):
 
 | Symptom | Cause / fix |
 |---|---|
-| `holds shard 2/4, not 3/4` | Each shard needs its own `--data-dir`. |
+| `buckets` run plans 0 buckets | No `index` artifact yet (run `index.yml`), an announced portal outage, or everything is done. The plan job's log says which. |
+| A bucket job failed | Re-dispatch `buckets.yml`; it plans only what is missing and resumes `part-NNN` if there is one. |
+| `existing database doesn't match bucket N of this index` | Partial work from an older index; the bucket starts over. Expected after rebuilding the index. |
+| Index job fails with `N days could not be completed` | Three passes weren't enough (server trouble). Re-run the workflow. |
+| `saw X rows of Y, N repeated across pages` | Paging shifted mid-search (new filings). The day isn't marked done; the next pass retries it. |
+| `N documents in one day hits the API's 10,000 cap` | A filing day with ≥10,000 parking-citation documents. Split that day's listing by hour. |
+| Rate keeps dropping (`rate cut to ...`) | The server is erroring or slow. Leave it; it recovers on its own within minutes of the server recovering. |
 | `Tesseract OCR not found` | Install it, or set `TESSERACT_CMD` to the executable. |
-| Many `no_doc` with `pdfs: [...]` listing unfamiliar names | A ticket document name the pipeline doesn't know yet. Add it to the name list in `fetch_one`. |
-| `saw X of Y results` on a search day | New filings arrived mid-search. The day isn't marked done; the next run retries it. |
-| Rate keeps dropping (`rate cut to ...`) | The server is erroring or slow. Leave it; it recovers on its own. Lower `--interval` for good if it persists. |
-| GitHub shard stopped chaining | Restart it with `gh workflow run ... -f shards="[K]"`. The 2-hour schedule also restarts it. |
-| `database is locked` | Two processes on one database. Run one pipeline process per data directory. |
-| ovid12 tmux session gone after a reboot | Rerun `linux/setup.sh` if `/var/tmp` was wiped, then start the tmux session again. It restores from `~/smc_backup`. |
-| Key login to `smc-runner` asks for a passphrase | The key has a passphrase. Remove it: `ssh-keygen -p -f ~/.ssh/smc-runner -N ''`. |
+| `sync_results.ps1` says `no index on GitHub yet` | The `index` artifact expired (90 days) or was never built. |
+| Images missing for a finished bucket | Its `images-NNN` artifact expired before syncing (30 days). Re-fetch that bucket: delete its `done-NNN` artifact and re-dispatch. |

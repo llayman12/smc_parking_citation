@@ -100,7 +100,9 @@ class Client:
       row the interval eases back 10% toward the floor (`min_interval`) the user asked for.
     """
 
-    def __init__(self, min_interval=1 / 3, retries=4, max_interval=10.0, recover_after=200):
+    SLOW_LATENCY = 10.0  # seconds (smoothed); normal is 0.5-4s. Above this the server is struggling: slow down.
+
+    def __init__(self, min_interval=0.2, retries=4, max_interval=10.0, recover_after=200):
         self.min_interval = min_interval
         self.interval = min_interval
         self.max_interval = max_interval
@@ -112,6 +114,8 @@ class Client:
         self._clean_streak = 0
         self.requests = self.failures = 0
         self.latency_total = 0.0
+        self._ewma = None
+        self._last_slowdown = 0.0
         self._local = threading.local()
 
     def stats(self):
@@ -122,8 +126,18 @@ class Client:
         with self._lock:
             self.requests += 1
             self.latency_total += latency
+            self._ewma = latency if self._ewma is None else 0.95 * self._ewma + 0.05 * latency
+            if self._ewma > self.SLOW_LATENCY and time.monotonic() - self._last_slowdown > 60:
+                # no errors, but responses are slowing: back off before the server starts failing
+                self.interval = min(self.max_interval, self.interval * 1.5)
+                self._last_slowdown = time.monotonic()
+                self._clean_streak = 0
+                print(f"  ! server slowing (avg {self._ewma:.1f}s per request); rate cut to "
+                      f"{1 / self.interval:.2f} req/s", file=sys.stderr)
+                return
             self._clean_streak += 1
-            if self._clean_streak >= self.recover_after and self.interval > self.min_interval:
+            if (self._clean_streak >= self.recover_after and self.interval > self.min_interval
+                    and self._ewma < self.SLOW_LATENCY / 2):
                 self.interval = max(self.min_interval, self.interval * 0.9)
                 self._clean_streak = 0
                 print(f"  + {self.recover_after} clean responses; easing up to {1 / self.interval:.2f} req/s",
@@ -262,12 +276,23 @@ def cmd_search(args):
     """Each day is an independent job: workers page through days in parallel (sharing one rate limit),
     and this thread does all database writes. A day is marked searched only once all its pages are in."""
     db, c = connect(args.data_dir), Client(args.interval)
+    # A database belongs to one shard: refuse to mix, or merged results would double-count or miss days.
+    db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    shard = f"{args.shard[0]}/{args.shard[1]}"
+    have = db.execute("SELECT value FROM meta WHERE key='shard'").fetchone()
+    if have and have[0] != shard:
+        sys.exit(f"{args.data_dir} holds shard {have[0]}, not {shard}; use a separate --data-dir per shard")
+    db.execute("INSERT OR REPLACE INTO meta VALUES ('shard', ?)", (shard,))
+    db.commit()
     d, end, days = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to), []
+    k, n = args.shard
     while d <= end:
-        if args.redo or not db.execute("SELECT 1 FROM searched_days WHERE day=?", (d.isoformat(),)).fetchone():
+        if d.toordinal() % n == k and (
+                args.redo or not db.execute("SELECT 1 FROM searched_days WHERE day=?", (d.isoformat(),)).fetchone()):
             days.append(d)
         d += timedelta(days=1)
-    print(f"{len(days)} days to search with {args.workers} workers, up to {1 / args.interval:.1f} req/s")
+    print(f"{len(days)} days to search (shard {k}/{n}) with {args.workers} workers, "
+          f"up to {1 / args.interval:.1f} req/s")
     t0, failed = time.monotonic(), []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         jobs = bounded(pool, lambda d: search_day(c, d, args.sample), days, args.workers * 2, args)
@@ -641,6 +666,48 @@ def cmd_export(args):
     print(f"wrote {len(rows)} rows to {args.out}")
 
 
+def cmd_backup(args):
+    """Consistent copy of the database (safe while other stages run), e.g. to a OneDrive folder.
+    Written to a temp name and then renamed, so a sync client never uploads a half-written file."""
+    db = connect(args.data_dir)
+    os.makedirs(os.path.dirname(os.path.abspath(args.to)), exist_ok=True)
+    tmp = args.to + ".partial"
+    out = sqlite3.connect(tmp)
+    db.backup(out)
+    out.close()
+    os.replace(tmp, args.to)
+    print(f"backed up to {args.to} ({os.path.getsize(args.to) / 1e6:.0f} MB)")
+
+
+def cmd_merge(args):
+    """Combine shard databases (each covers different days, so rows never collide) into --data-dir."""
+    db = connect(args.data_dir)
+    for path in args.sources:
+        db.execute("ATTACH DATABASE ? AS src", (path,))
+        cols = [r[1] for r in db.execute("PRAGMA src.table_info(citations)")]
+        sel = ", ".join(cols)
+        db.execute(f"INSERT OR REPLACE INTO citations ({sel}) SELECT {sel} FROM src.citations")
+        db.execute("INSERT OR REPLACE INTO searched_days SELECT * FROM src.searched_days")
+        db.execute("INSERT OR IGNORE INTO geocodes SELECT * FROM src.geocodes")
+        n = db.execute("SELECT COUNT(*) FROM src.citations").fetchone()[0]
+        db.commit()
+        db.execute("DETACH DATABASE src")
+        print(f"merged {n} citations from {path}")
+    cmd_status(args)
+
+
+def cmd_remaining(args):
+    """Print how much work is left for this shard: unsearched days + citations not yet fetched/OCR'd."""
+    db = connect(args.data_dir)
+    k, n = args.shard
+    d, end = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to)
+    searched = {r[0] for r in db.execute("SELECT day FROM searched_days")}
+    days = (d + timedelta(i) for i in range((end - d).days + 1))
+    days_left = sum(1 for x in days if x.toordinal() % n == k and x.isoformat() not in searched)
+    todo = db.execute("SELECT COUNT(*) FROM citations WHERE status IN ('new', 'fetched')").fetchone()[0]
+    print(days_left + todo)
+
+
 def cmd_status(args):
     db = connect(args.data_dir)
     for r in db.execute("SELECT status, COUNT(*) n FROM citations GROUP BY status ORDER BY n DESC"):
@@ -654,8 +721,11 @@ def cmd_status(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", default="data", help="where parking.db and ticket images live (default: ./data)")
-    p.add_argument("--interval", type=float, default=1 / 3,
-                   help="minimum seconds between API requests across all workers (default 0.333 = 3 req/s); "
+    p.add_argument("--shard", default="0/1", type=lambda s: tuple(int(x) for x in s.split("/")),
+                   help="k/N: handle only days whose ordinal %% N == k, so N machines can split the work "
+                        "with no overlap (default 0/1 = everything). Use a separate --data-dir per shard.")
+    p.add_argument("--interval", type=float, default=0.2,
+                   help="minimum seconds between API requests across all workers (default 0.2 = 5 req/s); "
                         "doubles automatically on errors and eases back after clean runs")
     p.add_argument("--stop-at", type=float, help="unix time after which search/fetch start no new work (for CI time limits)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -672,8 +742,8 @@ def main():
     s.add_argument("--limit", type=int)
     s.add_argument("--retry", action="store_true", help="also retry error and no_doc rows")
     s.add_argument("--with-charges", action="store_true", help="also pull classification and disposition (+2 requests each)")
-    s.add_argument("--workers", type=int, default=8,
-                   help="parallel downloads; total request rate is still capped by --interval (default 8)")
+    s.add_argument("--workers", type=int, default=16,
+                   help="parallel downloads; total request rate is still capped by --interval (default 16)")
     s.add_argument("--ocr", action="store_true", help="OCR each image as soon as it is downloaded")
     s.add_argument("--ocr-workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
                    help="parallel Tesseract processes with --ocr (default: CPU count - 1)")
@@ -699,6 +769,19 @@ def main():
     s.set_defaults(func=cmd_export)
 
     sub.add_parser("status").set_defaults(func=cmd_status)
+
+    s = sub.add_parser("remaining", help="print the amount of work left for this shard (0 = done)")
+    s.add_argument("--from", dest="date_from", required=True)
+    s.add_argument("--to", dest="date_to", required=True)
+    s.set_defaults(func=cmd_remaining)
+
+    s = sub.add_parser("backup",help="copy the database somewhere safe (e.g. OneDrive) while running")
+    s.add_argument("--to", required=True, help="destination .db file")
+    s.set_defaults(func=cmd_backup)
+
+    s = sub.add_parser("merge", help="combine shard databases into --data-dir")
+    s.add_argument("sources", nargs="+", help="shard parking.db files")
+    s.set_defaults(func=cmd_merge)
 
     args = p.parse_args()
     args.func(args)

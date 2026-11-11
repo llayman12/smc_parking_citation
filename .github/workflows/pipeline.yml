@@ -1,26 +1,28 @@
-# Runs the parking citation pipeline in ~5-hour chunks on one runner at a time.
-# State (data/parking.db) is carried between runs as the "state" artifact; each run queues the next one
-# until every day is searched and every citation is fetched. The schedule is only a backstop in case the
-# chain breaks; concurrency keeps it to a single runner, so the court's server sees one client at the
-# --interval rate.
+# Runs the parking citation pipeline in ~5-hour chunks.
+#
+# The work is split by day into TOTAL_SHARDS shards (day ordinal % TOTAL_SHARDS). GitHub runs the shards in
+# GH_SHARDS; the others run on local machines (run_shard.ps1). Each shard keeps its own database, carried
+# between GitHub runs as the "state-shard-K-of-N" artifact, and each shard job queues its own next run
+# until its days are searched and its citations fetched. The schedule is only a backstop in case a chain
+# breaks; per-shard concurrency keeps it to one job per shard. Shards never overlap; combine them at the
+# end with `parking_pipeline.py merge`.
 name: parking-pipeline
 
 on:
   workflow_dispatch:
     inputs:
+      shards:
+        description: "JSON list of shards to run, e.g. [0,1] or [1]"
+        default: "[0,1]"
       interval:
-        description: "Seconds between API requests across all workers (0.333 = 3 per second)"
-        default: "0.333"
+        description: "Seconds between API requests per shard (0.2 = 5 per second)"
+        default: "0.2"
       retry:
         description: "Also retry citations that errored or had no document"
         type: boolean
         default: false
   schedule:
     - cron: "23 */2 * * *"
-
-concurrency:
-  group: parking-pipeline
-  cancel-in-progress: false
 
 permissions:
   actions: write   # read the previous run's state artifact and queue the next run
@@ -29,14 +31,25 @@ permissions:
 env:
   FROM: "2020-01-01"
   TO: "2026-10-31"
-  INTERVAL: ${{ inputs.interval || '0.333' }}
+  TOTAL_SHARDS: "4"
+  INTERVAL: ${{ inputs.interval || '0.2' }}
   DATA: data
   GH_TOKEN: ${{ github.token }}
 
 jobs:
   run:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.shards || '[0,1]') }}
+    concurrency:
+      group: parking-shard-${{ matrix.shard }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    env:
+      K: ${{ matrix.shard }}
+      ARTIFACT: state-shard-${{ matrix.shard }}-of-${{ env.TOTAL_SHARDS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,34 +64,35 @@ jobs:
           sudo apt-get install -y -q tesseract-ocr
           pip install -q -r requirements.txt
 
-      - name: Restore state from the latest run
+      - name: Restore state from this shard's latest run
         id: restore
         run: |
           mkdir -p "$DATA"
-          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=state&per_page=1" \
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=1" \
                    -q '.artifacts[] | select(.expired == false) | .workflow_run.id')
           if [ -n "$run_id" ]; then
-            gh run download "$run_id" -n state -D "$DATA"
+            gh run download "$run_id" -n "$ARTIFACT" -D "$DATA"
             gunzip -f "$DATA/parking.db.gz"
-            echo "restored state from run $run_id ($(du -h "$DATA/parking.db" | cut -f1))"
+            echo "restored shard $K state from run $run_id ($(du -h "$DATA/parking.db" | cut -f1))"
           else
-            echo "no previous state; starting fresh"
+            echo "no previous state for shard $K; starting fresh"
           fi
 
       - name: Search, fetch + OCR, geocode
         continue-on-error: true   # whatever happens, save the progress made
         run: |
           start=$(date +%s)
-          P="python -u parking_pipeline.py --data-dir $DATA --interval $INTERVAL"
+          P="python -u parking_pipeline.py --data-dir $DATA --shard $K/$TOTAL_SHARDS --interval $INTERVAL"
           RETRY=${{ inputs.retry && '--retry' || '' }}
           $P --stop-at $((start + 260 * 60)) search --from "$FROM" --to "$TO"
-          $P --stop-at $((start + 280 * 60)) fetch --ocr --delete-images all $RETRY
+          $P --stop-at $((start + 280 * 60)) fetch --ocr --ocr-workers 4 --delete-images all $RETRY
           $P --stop-at $((start + 300 * 60)) geocode
 
       - name: Status
         if: always() && steps.restore.outcome == 'success'
         run: |
-          { echo '```'; python parking_pipeline.py --data-dir "$DATA" status; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          { echo "### shard $K of $TOTAL_SHARDS"; echo '```'
+            python parking_pipeline.py --data-dir "$DATA" status; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Compress state
         if: always() && steps.restore.outcome == 'success'
@@ -88,29 +102,19 @@ jobs:
         if: always() && steps.restore.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: state
+          name: ${{ env.ARTIFACT }}
           path: data/parking.db.gz
           retention-days: 7
           compression-level: 0
           if-no-files-found: error
 
-      - name: Queue the next run if work remains
+      - name: Queue this shard's next run if work remains
         if: success()
         run: |
-          left=$(python - <<'EOF'
-          import os, sqlite3
-          from datetime import date, timedelta
-          db = sqlite3.connect(os.path.join(os.environ["DATA"], "parking.db"))
-          d, end = date.fromisoformat(os.environ["FROM"]), date.fromisoformat(os.environ["TO"])
-          searched = {r[0] for r in db.execute("SELECT day FROM searched_days")}
-          days_left = sum(1 for i in range((end - d).days + 1) if (d + timedelta(i)).isoformat() not in searched)
-          new = db.execute("SELECT COUNT(*) FROM citations WHERE status IN ('new', 'fetched')").fetchone()[0]
-          print(days_left + new)
-          EOF
-          )
-          echo "work remaining: $left"
+          left=$(python parking_pipeline.py --data-dir "$DATA" --shard "$K/$TOTAL_SHARDS" remaining --from "$FROM" --to "$TO")
+          echo "shard $K work remaining: $left"
           if [ "$left" -gt 0 ]; then
-            gh workflow run pipeline.yml --ref "$GITHUB_REF_NAME" -f interval="$INTERVAL"
+            gh workflow run pipeline.yml --ref "$GITHUB_REF_NAME" -f shards="[$K]" -f interval="$INTERVAL"
           else
-            echo "All days searched and all citations fetched. Run once with retry=true, then disable this workflow."
+            echo "Shard $K is done. Run it once with retry=true, then remove it from the schedule."
           fi

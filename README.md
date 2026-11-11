@@ -18,30 +18,54 @@ a census tract, to study whether parking enforcement differs across Seattle neig
 All stages are resumable; state lives in `data/parking.db` (SQLite). Requests from all workers share one
 rate limit (`--interval`, default 3 per second) that halves on any error and recovers after clean runs.
 
-## Running on GitHub Actions
+## Shards
 
-`.github/workflows/pipeline.yml` runs the whole 2020-01-01 .. 2026-10-31 range in ~5-hour chunks on a
-single runner, carrying the database between runs as the `state` artifact and queuing the next run until
-the work is done. Start it from the Actions tab (**parking-pipeline → Run workflow**) or:
+The 2020-01-01 .. 2026-10-31 range is split by day into 4 shards (`--shard K/4` takes days whose ordinal
+% 4 == K), each with its own database and its own 5 requests/second budget:
+
+| Shard | Runs on |
+|---|---|
+| 0, 1 | GitHub Actions (`.github/workflows/pipeline.yml`) |
+| 2 | local PC: `.\run_shard.ps1 -Shard 2` |
+| 3 | UW machine: `.\run_shard.ps1 -Shard 3 -DataDir C:\Temp\smc -BackupDir "$env:OneDrive\SMCData"` |
+
+Each shard also backs off on its own when the court server returns errors or slows down.
+
+### GitHub Actions
+
+Each shard job runs ~5 hours, saves its database as the `state-shard-K-of-4` artifact and queues its own
+next run until its work is done. Start or restart from the Actions tab or:
 
 ```powershell
-gh workflow run pipeline.yml -R llayman12/smc_parking_citation
+gh workflow run pipeline.yml -R llayman12/smc_parking_citation -f shards="[0,1]"
 ```
 
-Get the latest results:
+Download a shard's latest database:
 
 ```powershell
-$id = gh api repos/llayman12/smc_parking_citation/actions/artifacts?name=state"&"per_page=1 -q '.artifacts[0].workflow_run.id'
-gh run download $id -n state -D C:\SMCData\ci -R llayman12/smc_parking_citation
-python -c "import gzip,shutil; shutil.copyfileobj(gzip.open(r'C:\SMCData\ci\parking.db.gz'), open(r'C:\SMCData\ci\parking.db','wb'))"
-python parking_pipeline.py --data-dir C:\SMCData\ci export --out C:\SMCData\ci\parking_citations.csv
+$k = 0
+$id = gh api "repos/llayman12/smc_parking_citation/actions/artifacts?name=state-shard-$k-of-4&per_page=1" -q '.artifacts[0].workflow_run.id'
+gh run download $id -n "state-shard-$k-of-4" -D C:\SMCData\gh$k -R llayman12/smc_parking_citation
+python -c "import gzip,shutil; shutil.copyfileobj(gzip.open(r'C:\SMCData\gh$k\parking.db.gz'), open(r'C:\SMCData\gh$k\parking.db','wb'))"
 ```
 
-When the run reports that all work is done, run it once more with **retry** checked, then disable the workflow.
+### Combine and export
 
-## Running locally
+```powershell
+python parking_pipeline.py --data-dir C:\SMCData\all merge C:\SMCData\gh0\parking.db C:\SMCData\gh1\parking.db C:\SMCData\shard-2-of-4\parking.db C:\SMCData\uw\parking-shard-3-of-4.db
+python parking_pipeline.py --data-dir C:\SMCData\all export --out C:\SMCData\parking_citations.csv
+```
+
+When a shard reports it is done, run it once more with retry (`-f retry=true`, or
+`fetch --retry --ocr --delete-images all` locally).
+
+## Setup
 
 ```powershell
 python -m pip install -r requirements.txt   # plus Tesseract: winget install UB-Mannheim.TesseractOCR
-.\run_years.ps1                              # year by year into C:\SMCData
 ```
+
+## Known data gaps
+
+Some cases have no ticket document at all (e.g. many January 2024 cases have only officer comment/notes
+docket entries). They are kept with `status = no_doc`; the `error` column lists what documents the case had.

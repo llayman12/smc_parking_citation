@@ -1,0 +1,148 @@
+# Step 2 of 2. Downloads and OCRs the tickets, one bucket per job.
+#
+# The index (see index.yml) splits all citations into 256 buckets by a hash of the citation number, so every
+# bucket is a uniform random sample of the whole date range (~9,000 tickets, roughly an hour of work). The
+# plan job lists the buckets that have no "done-NNN" artifact yet; up to `workers` bucket jobs then run at a
+# time. A finished bucket uploads:
+#   done-NNN    its SQLite database (gzipped)                kept 90 days
+#   images-NNN  the page-1 ticket images it downloaded       kept 30 days
+# sync_results.ps1 pulls both down to a PC / OneDrive, which is their permanent home.
+# A bucket that hits the time limit (or an announced portal outage) uploads "part-NNN" instead and is resumed
+# by the next run. Nothing here depends on a previous job having succeeded: re-dispatching (or the schedule)
+# simply plans whatever is still missing.
+name: buckets
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: "Bucket jobs running at once (each is one source of requests)"
+        default: "4"
+      interval:
+        description: "Seconds between API requests per job (0.3 = 3.3 per second)"
+        default: "0.3"
+      smoke:
+        description: "Smoke test: 2 buckets, 40 tickets each (they are left unfinished and resumed later)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "41 */6 * * *"   # backstop: picks up anything left over; waits if a run is in progress
+
+concurrency:
+  group: buckets
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  INTERVAL: ${{ inputs.interval || '0.3' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      buckets: ${{ steps.plan.outputs.buckets }}
+      index_run: ${{ steps.plan.outputs.index_run }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - id: plan
+        run: |
+          index=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=index&per_page=1" \
+                  -q '.artifacts[] | select(.expired == false) | "\(.workflow_run.id) \(.created_at)"')
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+             -q '.artifacts[] | select(.expired == false) | "\(.name) \(.created_at)"' > artifacts.txt
+          python - <<'EOF' "${{ inputs.smoke }}" $index >> "$GITHUB_OUTPUT"
+          import json, sys
+          import parking_pipeline as p
+          smoke = sys.argv[1] == "true"
+          index_run, index_time = (sys.argv[2:4] + ["", ""])[:2]
+          # only buckets finished AFTER the current index was built count: an older index cut buckets differently
+          done = {int(name[5:]) for name, created in (l.split() for l in open("artifacts.txt"))
+                  if name.startswith("done-") and created > index_time}
+          todo = [b for b in range(256) if b not in done]
+          if not index_run or p.maintenance_end():
+              todo = []   # no index yet, or the court portal is in an announced outage
+          if smoke:
+              todo = todo[:2]
+          print(f"buckets={json.dumps(todo)}")
+          print(f"index_run={index_run}")
+          print(f"{len(done)} buckets done, {len(todo)} planned (index run: {index_run or 'none'})", file=sys.stderr)
+          EOF
+
+  work:
+    needs: plan
+    if: needs.plan.outputs.buckets != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.workers || '4') }}
+      matrix:
+        bucket: ${{ fromJSON(needs.plan.outputs.buckets) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Tesseract and Python packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q tesseract-ocr
+          pip install -q -r requirements.txt
+          printf 'NNN=%03d\n' "${{ matrix.bucket }}" >> "$GITHUB_ENV"
+
+      - name: Get the index and any partial work on this bucket
+        run: |
+          gh run download "${{ needs.plan.outputs.index_run }}" -n index -D index -R "$GITHUB_REPOSITORY"
+          gunzip index/parking.db.gz
+          mkdir -p data
+          part_run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=part-$NNN&per_page=1" \
+                     -q '.artifacts[] | select(.expired == false) | .workflow_run.id')
+          if [ -n "$part_run" ]; then
+            gh run download "$part_run" -n "part-$NNN" -D data -R "$GITHUB_REPOSITORY"
+            gunzip -f data/parking.db.gz
+            echo "resuming bucket $NNN from run $part_run"
+          fi
+
+      - name: Fetch and OCR the bucket
+        id: work
+        run: |
+          start=$(date +%s)
+          P="python -u parking_pipeline.py --data-dir data --interval $INTERVAL --stop-at $((start + 300 * 60))"
+          LIMIT=${{ inputs.smoke && '--limit 40' || '' }}
+          $P take-bucket --index index/parking.db --bucket "${{ matrix.bucket }}"
+          $P fetch --ocr --ocr-workers 4 --workers 12 $LIMIT
+          [ -n "$LIMIT" ] || $P fetch --ocr --ocr-workers 4 --workers 12 --retry-errors   # one more try for errors
+          left=$(python parking_pipeline.py --data-dir data remaining)
+          if [ "$left" = "0" ]; then echo "name=done-$NNN" >> "$GITHUB_OUTPUT"; else echo "name=part-$NNN" >> "$GITHUB_OUTPUT"; fi
+          { echo "### bucket $NNN: $left left"; echo '```'
+            python parking_pipeline.py --data-dir data status; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          gzip -k data/parking.db
+
+      - name: Save the bucket database
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.work.outputs.name }}
+          path: data/parking.db.gz
+          retention-days: 90
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Save the ticket images
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ env.NNN }}
+          path: data/tickets
+          retention-days: 30
+          compression-level: 0     # PNGs don't compress further
+          if-no-files-found: ignore

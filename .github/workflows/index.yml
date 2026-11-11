@@ -1,0 +1,111 @@
+# Step 1 of 2. Builds the work index: every parking citation in the date range (citation search, by
+# violation day), joined to its ticket document (document listing, by filing day), and split into buckets.
+# Four jobs each cover a quarter of the days; a final job merges them into the "index" artifact and starts
+# the bucket workflow. ~20,000 requests in total, about 45 minutes.
+name: build-index
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "First violation day"
+        default: "2020-01-01"
+      to:
+        description: "Last violation day"
+        default: "2026-10-31"
+      interval:
+        description: "Seconds between API requests per job (0.2 = 5 per second)"
+        default: "0.2"
+      start_buckets:
+        description: "Start the bucket workflow when the index is ready"
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-index
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # start the bucket workflow
+  contents: read
+
+env:
+  FROM: ${{ inputs.from }}
+  TO: ${{ inputs.to }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  list:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -q -r requirements.txt
+
+      - name: Search citations and list ticket documents
+        run: |
+          P="python -u parking_pipeline.py --data-dir data --shard ${{ matrix.shard }}/4 --interval ${{ inputs.interval }}"
+          TODAY=$(TZ=America/Los_Angeles date +%F)   # documents can be filed long after the violation
+          $P wait-maintenance --max-minutes 150
+          for pass in 1 2 3; do                      # later passes only redo days that failed
+            $P search --from "$FROM" --to "$TO"
+            $P list-docs --from "$FROM" --to "$TODAY"
+            missing=$($P missing-days --from "$FROM" --to "$TO" --docs-to "$TODAY")
+            echo "pass $pass: $missing days missing"
+            [ "$missing" = "0" ] && break
+          done
+          [ "$missing" = "0" ] || { echo "::error::$missing days could not be completed"; exit 1; }
+          gzip data/parking.db
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: index-part-${{ matrix.shard }}
+          path: data/parking.db.gz
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  merge:
+    needs: list
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -q -r requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: index-part-*
+          path: parts
+
+      - name: Merge and build the index
+        run: |
+          for d in parts/index-part-*; do gunzip "$d/parking.db.gz"; done
+          python parking_pipeline.py --data-dir index merge parts/index-part-*/parking.db
+          { echo '### Index'; echo '```'
+            python parking_pipeline.py --data-dir index build-index --buckets 256 --slim
+            echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          gzip index/parking.db && ls -lh index
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: index
+          path: index/parking.db.gz
+          retention-days: 90
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Start the bucket workflow
+        if: inputs.start_buckets
+        run: gh workflow run buckets.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"

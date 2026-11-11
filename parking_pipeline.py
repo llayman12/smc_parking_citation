@@ -29,6 +29,7 @@ import csv
 import hashlib
 import io
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -103,23 +104,38 @@ CREATE TABLE IF NOT EXISTS geocodes (
     geoid_tract TEXT
 );
 CREATE TABLE IF NOT EXISTS searched_days (day TEXT PRIMARY KEY, total INTEGER, parking INTEGER);
+-- every "Complaint - Parking Citation" document, listed by the day its docket entry was filed
+CREATE TABLE IF NOT EXISTS documents (
+    doc_link_uuid TEXT PRIMARY KEY, case_uuid TEXT NOT NULL, document_name TEXT, filed_date TEXT);
+CREATE INDEX IF NOT EXISTS documents_case ON documents (case_uuid);
+CREATE TABLE IF NOT EXISTS listed_days (day TEXT PRIMARY KEY, total INTEGER);
+-- one row per minute of requests made by this database's runs: for measuring server capacity passively
+CREATE TABLE IF NOT EXISTS latency_log (
+    minute TEXT, requests INTEGER, total_latency REAL, max_latency REAL, failures INTEGER, rate_cap REAL);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
+PARKING_CITATION_SUBTYPE = 1001507  # docket entry sub type "Complaint - Parking Citation"
 
 
 # ---------------------------------------------------------------- helpers
 class Client:
     """Thread-safe requests wrapper with an adaptive, shared rate limit.
 
-    - Request *starts* are spaced at least `interval` apart across ALL threads, so the total
-      request rate is fixed however many workers run.
-    - Dial back automatically: any 429/5xx, timeout or connection error doubles the interval
-      (up to max_interval) and pauses every worker. After `recover_after` clean responses in a
-      row the interval eases back 10% toward the floor (`min_interval`) the user asked for.
+    - Request *starts* are spaced about `interval` apart across ALL threads (with +-20% random jitter,
+      so several machines don't fall into step), so the total rate is fixed however many workers run.
+    - Errors: any 429/5xx, timeout or connection error doubles the interval (up to max_interval) and
+      pauses every worker.
+    - Latency: when the smoothed response time passes SLOW_LATENCY the interval grows 1.5x (at most
+      every 30 s), before the server starts failing.
+    - Recovery: after `recover_after` clean responses in a row, with latency back under half the
+      threshold, the interval shrinks 15% toward the floor (`min_interval`) the user asked for. From a
+      deep cut that is minutes, not hours.
+    - Every request is tallied per minute (`minutes`) so capacity can be measured from real runs.
     """
 
-    SLOW_LATENCY = 10.0  # seconds (smoothed); normal is 0.5-4s. Above this the server is struggling: slow down.
+    SLOW_LATENCY = 6.0  # seconds (smoothed); normal is 0.3-3s. Above this the server is struggling: slow down.
 
-    def __init__(self, min_interval=0.2, retries=4, max_interval=10.0, recover_after=200):
+    def __init__(self, min_interval=0.2, retries=4, max_interval=10.0, recover_after=30):
         self.min_interval = min_interval
         self.interval = min_interval
         self.max_interval = max_interval
@@ -134,6 +150,27 @@ class Client:
         self._ewma = None
         self._last_slowdown = 0.0
         self._local = threading.local()
+        self.minutes = {}  # "YYYY-MM-DDTHH:MM" (Seattle) -> [requests, total latency, max latency, failures, rate cap]
+
+    def _tally(self, latency, failed):
+        """Caller holds the lock."""
+        m = self.minutes.setdefault(datetime.now(TZ).strftime("%Y-%m-%dT%H:%M"), [0, 0.0, 0.0, 0, 0.0])
+        m[0] += 1
+        m[1] += latency
+        m[2] = max(m[2], latency)
+        m[3] += int(failed)
+        m[4] = 1 / self.interval
+
+    def flush_minutes(self, db, final=False):
+        """Write finished minutes (all of them when `final`) to the latency_log table.
+        Call from the thread that owns `db`."""
+        with self._lock:
+            current = None if final else datetime.now(TZ).strftime("%Y-%m-%dT%H:%M")
+            done = {k: v for k, v in self.minutes.items() if k != current}
+            for k in done:
+                del self.minutes[k]
+        db.executemany("INSERT INTO latency_log VALUES (?,?,?,?,?,?)", [(k, *v) for k, v in done.items()])
+        db.commit()
 
     def stats(self):
         avg = self.latency_total / self.requests if self.requests else 0
@@ -143,8 +180,9 @@ class Client:
         with self._lock:
             self.requests += 1
             self.latency_total += latency
-            self._ewma = latency if self._ewma is None else 0.95 * self._ewma + 0.05 * latency
-            if self._ewma > self.SLOW_LATENCY and time.monotonic() - self._last_slowdown > 60:
+            self._tally(latency, False)
+            self._ewma = latency if self._ewma is None else 0.9 * self._ewma + 0.1 * latency
+            if self._ewma > self.SLOW_LATENCY and time.monotonic() - self._last_slowdown > 30:
                 # no errors, but responses are slowing: back off before the server starts failing
                 self.interval = min(self.max_interval, self.interval * 1.5)
                 self._last_slowdown = time.monotonic()
@@ -155,10 +193,10 @@ class Client:
             self._clean_streak += 1
             if (self._clean_streak >= self.recover_after and self.interval > self.min_interval
                     and self._ewma < self.SLOW_LATENCY / 2):
-                self.interval = max(self.min_interval, self.interval * 0.9)
+                self.interval = max(self.min_interval, self.interval * 0.85)
                 self._clean_streak = 0
-                print(f"  + {self.recover_after} clean responses; easing up to {1 / self.interval:.2f} req/s",
-                      file=sys.stderr)
+                if self.interval == self.min_interval:
+                    print(f"  + back to full rate ({1 / self.interval:.2f} req/s)", file=sys.stderr)
 
     def slow_down(self, why):
         """Halve the rate on a sign of trouble that isn't an HTTP error (e.g. suspicious empty responses)."""
@@ -171,6 +209,7 @@ class Client:
         backoff = 5 * 3 ** attempt
         with self._lock:
             self.failures += 1
+            self._tally(0.0, True)
             self._clean_streak = 0
             self.interval = min(self.max_interval, self.interval * 2)
             self._paused_until = max(self._paused_until, time.monotonic() + backoff)
@@ -186,7 +225,7 @@ class Client:
     def _wait_turn(self):
         with self._lock:
             start = max(time.monotonic(), self._next_slot, self._paused_until)
-            self._next_slot = start + self.interval
+            self._next_slot = start + self.interval * random.uniform(0.8, 1.2)
         delay = start - time.monotonic()
         if delay > 0:
             time.sleep(delay)
@@ -222,7 +261,13 @@ def connect(data_dir):
         db.execute("ALTER TABLE citations ADD COLUMN citing_agency TEXT")
     if "doc_link_uuid" not in cols:  # ticket PDF id, so handwritten tickets can be re-downloaded for manual entry
         db.execute("ALTER TABLE citations ADD COLUMN doc_link_uuid TEXT")
+    if "bucket" not in cols:  # work unit: hash of the citation number, so every bucket is a random sample
+        db.execute("ALTER TABLE citations ADD COLUMN bucket INTEGER")
     return db
+
+
+def bucket_of(citation_number, buckets):
+    return int(hashlib.sha1(citation_number.encode()).hexdigest()[8:16], 16) % buckets
 
 
 def past_deadline(args):
@@ -271,18 +316,28 @@ def search_day(c, day, sample):
         "violationDateTo": (start + timedelta(days=1) - timedelta(milliseconds=1)).isoformat(timespec="milliseconds"),
         "caseHeader.courtID": COURT,
         "size": 500,
-        "sort": "violationDate,asc",
+        # the second key breaks ties: many citations share a violation time, and with ties the server's
+        # paging can repeat some rows and skip others
+        "sort": ["violationDate,asc", "citationNumber,asc"],
     }
-    page, total_pages, total, rows, seen = 0, 1, 0, [], 0
+    page, total_pages, total, rows, seen, uniq, repeats = 0, 1, 0, [], 0, set(), 0
     while page < total_pages:
         j = c.get(f"{API}/courts/cms/citations", params={**params, "page": page}).json()
         total_pages = j["page"]["totalPages"]
         total = j["page"]["totalElements"]
         results = j.get("_embedded", {}).get("results", [])
         seen += len(results)
+        earlier_pages = set(uniq)
         for r in results:
             h = r["caseHeader"]
             cn = r["citationNumber"]
+            key = (cn, h["caseInstanceUUID"])
+            if key in uniq:
+                # The court's data has a few true duplicate rows, which sort next to each other. A row that
+                # repeats from an EARLIER page instead means paging shifted, so another row was skipped.
+                repeats += key in earlier_pages
+                continue
+            uniq.add(key)
             if h.get("caseCategory") != "Infraction" or not PARKING_CITATION_RE.match(cn):
                 continue
             if not in_sample(cn, sample):
@@ -294,9 +349,78 @@ def search_day(c, day, sample):
                          h.get("filedDate"), int(bool(h.get("closedFlag"))),
                          (r.get("citingAgencyActorInstance") or {}).get("displayName")))
         page += 1
-    if seen != total:  # pages shifted under us (new filings mid-search); caller retries the day
-        raise RuntimeError(f"saw {seen} of {total} results")
+    # pages shifted (new filings mid-search) or rows repeated across pages: caller retries the day.
+    # One cross-page repeat is tolerated: a true duplicate pair can straddle a page boundary.
+    if seen != total or repeats > 1:
+        raise RuntimeError(f"saw {seen} rows of {total}, {repeats} repeated across pages")
     return total, rows
+
+
+def list_docs_day(c, day):
+    """Every "Complaint - Parking Citation" document whose docket entry was filed on `day` (Seattle time).
+    Returns (total, rows); raises if the listing is incomplete."""
+    start = datetime(day.year, day.month, day.day, tzinfo=TZ)
+    params = {
+        "docketEntryFiledDateFrom": start.isoformat(timespec="milliseconds"),
+        "docketEntryFiledDateTo": (start + timedelta(days=1) - timedelta(milliseconds=1)).isoformat(timespec="milliseconds"),
+        "docketEntrySubTypeID": PARKING_CITATION_SUBTYPE,
+        "caseHeader.courtID": COURT,
+        "size": 500,
+        "sort": "documentLinkUUID,asc",  # without an explicit sort, pages repeat and skip rows
+    }
+    page, total_pages, total, rows = 0, 1, 0, {}
+    while page < total_pages:
+        j = c.get(f"{API}/courts/cms/docketentrydocuments", params={**params, "page": page}).json()
+        total_pages = j["page"]["totalPages"]
+        total = j["page"]["totalElements"]
+        for d in j.get("_embedded", {}).get("results", []):
+            rows[d["documentLinkUUID"]] = (d["documentLinkUUID"], d["caseHeader"]["caseInstanceUUID"],
+                                           d.get("documentName"), d.get("docketEntryFiledDate"))
+        page += 1
+    if total >= 10000:  # the API caps any listing at 10,000 results
+        raise RuntimeError(f"{total} documents in one day hits the API's 10,000 cap; split the day")
+    if len(rows) != total:
+        raise RuntimeError(f"saw {len(rows)} unique documents of {total}")
+    return total, list(rows.values())
+
+
+def shard_days(db, args, done_table):
+    """Days in --from..--to that belong to this shard and aren't in `done_table` yet."""
+    d, end, days = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to), []
+    k, n = args.shard
+    done = set() if args.redo else {r[0] for r in db.execute(f"SELECT day FROM {done_table}")}
+    while d <= end:
+        if d.toordinal() % n == k and d.isoformat() not in done:
+            days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def cmd_list_docs(args):
+    """List every parking-citation document by filing day. With this list, fetch needs one request per
+    ticket (the download) instead of two, and tickets with no document are known without asking."""
+    db, c = connect(args.data_dir), Client(args.interval)
+    days = shard_days(db, args, "listed_days")
+    print(f"{len(days)} filing days to list (shard {args.shard[0]}/{args.shard[1]}) with {args.workers} workers, "
+          f"up to {1 / args.interval:.1f} req/s")
+    t0, failed, n_docs = time.monotonic(), 0, 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for i, (d, fut) in enumerate(bounded(pool, lambda d: list_docs_day(c, d), days, args.workers * 2, args), 1):
+            try:
+                total, rows = fut.result()
+            except Exception as e:
+                failed += 1
+                print(f"[{i}/{len(days)}] {d}: ERROR {e} (rerun to retry)", file=sys.stderr)
+                continue
+            db.executemany("INSERT OR REPLACE INTO documents VALUES (?,?,?,?)", rows)
+            db.execute("INSERT OR REPLACE INTO listed_days VALUES (?,?)", (d.isoformat(), total))
+            db.commit()
+            n_docs += total
+            if i % 25 == 0 or i == len(days):
+                print(f"[{i}/{len(days)}] {d}: {total} documents ({n_docs} so far)")
+    c.flush_minutes(db, final=True)
+    print(f"listed {n_docs} documents in {time.monotonic() - t0:.0f}s ({c.stats()})"
+          + (f"; {failed} days failed: rerun to retry" if failed else ""))
 
 
 def cmd_search(args):
@@ -311,13 +435,8 @@ def cmd_search(args):
         sys.exit(f"{args.data_dir} holds shard {have[0]}, not {shard}; use a separate --data-dir per shard")
     db.execute("INSERT OR REPLACE INTO meta VALUES ('shard', ?)", (shard,))
     db.commit()
-    d, end, days = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to), []
+    days = shard_days(db, args, "searched_days")
     k, n = args.shard
-    while d <= end:
-        if d.toordinal() % n == k and (
-                args.redo or not db.execute("SELECT 1 FROM searched_days WHERE day=?", (d.isoformat(),)).fetchone()):
-            days.append(d)
-        d += timedelta(days=1)
     print(f"{len(days)} days to search (shard {k}/{n}) with {args.workers} workers, "
           f"up to {1 / args.interval:.1f} req/s")
     t0, failed = time.monotonic(), []
@@ -341,6 +460,7 @@ def cmd_search(args):
             db.execute("INSERT OR REPLACE INTO searched_days VALUES (?,?,?)", (d.isoformat(), total, len(rows)))
             db.commit()
             print(f"[{i}/{len(days)}] {d}: {total} citations, {len(rows)} parking recorded")
+    c.flush_minutes(db, final=True)
     if past_deadline(args):
         print("stopped at --stop-at deadline; rerun to continue")
     print(f"search of {len(days)} days took {time.monotonic() - t0:.0f}s ({c.stats()})"
@@ -360,10 +480,14 @@ def page1_ticket_png(pdf_bytes):
     return buf.getvalue()
 
 
-def fetch_one(c, cn, case, img_dir, with_charges):
-    """Network work for one citation (runs in a worker thread). Returns a result dict; never raises."""
+def fetch_one(c, cn, case, img_dir, with_charges, link=None):
+    """Network work for one citation (runs in a worker thread). Returns a result dict; never raises.
+    With `link` (the ticket PDF's id, from the index built by list-docs) this is ONE request: the download.
+    Without it, the case's documents are looked up first (two requests)."""
     try:
         case_url = f"{API}/courts/{COURT}/cms/cases/{case}"
+        if link:
+            return download_ticket(c, cn, case, link, img_dir, case_url, with_charges)
         # One request lists every document on the case; the citation PDF is named after the citation number.
         acc = c.get(f"{API}/courts/cms/docketentrydocumentsaccess", params={
             "page": 0, "size": 50, "sort": "documentName,asc", "caseHeader.courtID": COURT,
@@ -381,29 +505,34 @@ def fetch_one(c, cn, case, img_dir, with_charges):
             # record what WAS there so unfamiliar document names can be audited later
             return {"status": "no_doc", "error": f"pdfs: {names}"[:500],
                     "msg": f"no citation document (pdfs: {names})"}
-        link = docs[0]["documentLinkUUID"]
-        pdf = c.get(f"{API}/courts/{COURT}/cms/case/{case}/docketentrydocuments/{link}").content
-        if not pdf.startswith(b"%PDF"):
-            raise RuntimeError(f"not a PDF: {pdf[:60]!r}")
-        png = page1_ticket_png(pdf)
-        if png is None:
-            raise RuntimeError("no image on page 1")
-        path = os.path.join(img_dir, f"{cn}.png")
-        with open(path, "wb") as f:
-            f.write(png)
-        extra = {}
-        if with_charges:
-            hdr = c.get(case_url).json().get("caseHeader", {})
-            ch = c.get(f"{case_url}/charges", params={"page": 0, "size": 20}).json()
-            ch = (ch.get("_embedded", {}).get("results") or [{}])[0]
-            extra = {"case_classification": hdr.get("caseClassification"),
-                     "statute_number": ch.get("statuteNumber"),
-                     "statute_description": ch.get("statuteDescription"),
-                     "dispo_type": ch.get("dispoType"), "dispo_method": ch.get("dispoMethod")}
-        return {"status": "fetched", "image_path": path, "extra": {**extra, "doc_link_uuid": link},
-                "msg": f"ok ({len(pdf)//1024} KB pdf -> {len(png)//1024} KB image)"}
+        return download_ticket(c, cn, case, docs[0]["documentLinkUUID"], img_dir, case_url, with_charges)
     except Exception as e:  # recorded as an error; retry later with --retry
         return {"status": "error", "error": str(e)[:500], "msg": f"ERROR {e}"}
+
+
+def download_ticket(c, cn, case, link, img_dir, case_url, with_charges):
+    """Download one ticket PDF and keep its page-1 image. Raises on any problem (fetch_one records it)."""
+    r = c.get(f"{API}/courts/{COURT}/cms/case/{case}/docketentrydocuments/{link}")
+    pdf = r.content
+    if not pdf.startswith(b"%PDF"):
+        raise RuntimeError(f"not a PDF (HTTP {r.status_code}): {pdf[:60]!r}")
+    png = page1_ticket_png(pdf)
+    if png is None:
+        raise RuntimeError("no image on page 1")
+    path = os.path.join(img_dir, f"{cn}.png")
+    with open(path, "wb") as f:
+        f.write(png)
+    extra = {}
+    if with_charges:
+        hdr = c.get(case_url).json().get("caseHeader", {})
+        ch = c.get(f"{case_url}/charges", params={"page": 0, "size": 20}).json()
+        ch = (ch.get("_embedded", {}).get("results") or [{}])[0]
+        extra = {"case_classification": hdr.get("caseClassification"),
+                 "statute_number": ch.get("statuteNumber"),
+                 "statute_description": ch.get("statuteDescription"),
+                 "dispo_type": ch.get("dispoType"), "dispo_method": ch.get("dispoMethod")}
+    return {"status": "fetched", "image_path": path, "extra": {**extra, "doc_link_uuid": link},
+            "msg": f"ok ({len(pdf)//1024} KB pdf -> {len(png)//1024} KB image)"}
 
 
 def case_has_documents(c, case):
@@ -432,10 +561,13 @@ def cmd_fetch(args):
                        [(cn,) for cn in lost])
         db.commit()
         print(f"{len(lost)} fetched tickets had no image on disk; queued again")
-    statuses = ("new", "error", "no_doc") if args.retry else ("new",)
+    statuses = ("new", "error", "no_doc") if args.retry else ("new", "error") if args.retry_errors else ("new",)
     skip = tuple(NON_PARKING_AGENCIES)  # rows recorded before search filtered these out
-    q = (f"SELECT citation_number, case_uuid FROM citations WHERE status IN ({','.join('?' * len(statuses))}) "
-         f"AND COALESCE(citing_agency, '') NOT IN ({','.join('?' * len(skip))}) ORDER BY violation_date")
+    # ORDER BY case_uuid = random order (the ids are random UUIDs), so whatever is finished at any moment
+    # is a uniform random sample of the whole set, not "the oldest tickets"
+    q = (f"SELECT citation_number, case_uuid, doc_link_uuid FROM citations "
+         f"WHERE status IN ({','.join('?' * len(statuses))}) "
+         f"AND COALESCE(citing_agency, '') NOT IN ({','.join('?' * len(skip))}) ORDER BY case_uuid")
     rows = db.execute(q + (f" LIMIT {int(args.limit)}" if args.limit else ""), statuses + skip).fetchall()
     print(f"{len(rows)} citations to fetch with {args.workers} workers, up to {1 / args.interval:.1f} req/s"
           + (f", OCR inline with {args.ocr_workers} workers" if args.ocr else ""))
@@ -474,7 +606,8 @@ def cmd_fetch(args):
     empty_streak, streak_is_real = [], False
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        work = lambda r: fetch_one(c, r["citation_number"], r["case_uuid"], img_dir, args.with_charges)
+        work = lambda r: fetch_one(c, r["citation_number"], r["case_uuid"], img_dir, args.with_charges,
+                                   r["doc_link_uuid"])
         for i, (row, fut) in enumerate(bounded(pool, work, rows, args.workers * 2, args), 1):
             cn, res = row["citation_number"], fut.result()
             if res["status"] == "no_doc" and res.get("error") == "pdfs: []":
@@ -511,15 +644,18 @@ def cmd_fetch(args):
                     wait(ocr_futures, return_when=FIRST_COMPLETED)
                     drain_ocr(block=False)
             rate = i / (time.monotonic() - t0) * 3600
-            print(f"[{i}/{len(rows)}] {cn}: {res['msg']}  ({rate:.0f}/hour)",
-                  file=sys.stderr if res["status"] == "error" else sys.stdout)
-            if i % 100 == 0:
+            if res["status"] == "error" or i % 25 == 0 or i == len(rows):
+                print(f"[{i}/{len(rows)}] {cn}: {res['msg']}  ({rate:.0f}/hour)",
+                      file=sys.stderr if res["status"] == "error" else sys.stdout)
+            if i % 250 == 0:
+                c.flush_minutes(db)
                 print(f"  -- {c.stats()}" + (f", {len(ocr_futures)} waiting for OCR" if ocr_pool else ""))
     if ocr_pool:
         # finish the (bounded) OCR backlog; with a deadline, give up after 15 minutes so the caller can
         # still save state. Anything unfinished stays 'fetched' and is redone next run.
         drain_ocr(block=True, timeout=15 * 60 if args.stop_at else None)
         ocr_pool.shutdown(wait=False, cancel_futures=True)
+    c.flush_minutes(db, final=True)
     if past_deadline(args):
         print("stopped at --stop-at deadline; rerun to continue")
     print(f"done in {time.monotonic() - t0:.0f}s: {counts} ({c.stats()})")
@@ -770,6 +906,12 @@ def cmd_merge(args):
         db.execute(f"INSERT OR REPLACE INTO citations ({sel}) SELECT {sel} FROM src.citations")
         db.execute("INSERT OR REPLACE INTO searched_days SELECT * FROM src.searched_days")
         db.execute("INSERT OR IGNORE INTO geocodes SELECT * FROM src.geocodes")
+        have = {r[0] for r in db.execute("SELECT name FROM src.sqlite_master WHERE type='table'")}
+        if "documents" in have:
+            db.execute("INSERT OR REPLACE INTO documents SELECT * FROM src.documents")
+            db.execute("INSERT OR REPLACE INTO listed_days SELECT * FROM src.listed_days")
+        if "latency_log" in have:  # EXCEPT keeps a repeated merge from doubling the log
+            db.execute("INSERT INTO latency_log SELECT * FROM src.latency_log EXCEPT SELECT * FROM latency_log")
         n = db.execute("SELECT COUNT(*) FROM src.citations").fetchone()[0]
         db.commit()
         db.execute("DETACH DATABASE src")
@@ -789,14 +931,82 @@ def cmd_wait_maintenance(args):
         time.sleep(60)
 
 
-def cmd_remaining(args):
-    """Print how much work is left for this shard: unsearched days + citations not yet fetched/OCR'd."""
+def cmd_build_index(args):
+    """Turn merged search + list-docs results into the work index: attach each citation's ticket document,
+    mark citations that have none, and assign every citation to a bucket."""
     db = connect(args.data_dir)
-    k, n = args.shard
-    d, end = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to)
-    searched = {r[0] for r in db.execute("SELECT day FROM searched_days")}
-    days = (d + timedelta(i) for i in range((end - d).days + 1))
-    days_left = sum(1 for x in days if x.toordinal() % n == k and x.isoformat() not in searched)
+    # prefer the document named after the citation number; otherwise the case's latest parking-citation document
+    db.execute("""UPDATE citations SET doc_link_uuid = COALESCE(
+                      (SELECT d.doc_link_uuid FROM documents d
+                        WHERE d.case_uuid = citations.case_uuid AND d.document_name = citations.citation_number),
+                      (SELECT d.doc_link_uuid FROM documents d
+                        WHERE d.case_uuid = citations.case_uuid ORDER BY d.filed_date DESC LIMIT 1))
+                  WHERE status IN ('new', 'no_doc')""")
+    db.execute("""UPDATE citations SET status='no_doc', error='no parking-citation document in the court listing'
+                  WHERE doc_link_uuid IS NULL AND status='new'""")
+    db.execute("UPDATE citations SET status='new', error=NULL WHERE doc_link_uuid IS NOT NULL AND status='no_doc'")
+    rows = [(bucket_of(r[0], args.buckets), r[0]) for r in db.execute("SELECT citation_number FROM citations")]
+    db.executemany("UPDATE citations SET bucket=? WHERE citation_number=?", rows)
+    db.execute("CREATE INDEX IF NOT EXISTS citations_bucket ON citations (bucket)")
+    db.execute("INSERT OR REPLACE INTO meta VALUES ('buckets', ?)", (str(args.buckets),))
+    db.execute("DELETE FROM meta WHERE key='shard'")
+    db.commit()
+    n_docs = db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    if args.slim:  # every worker downloads the index, and the document list is no longer needed in it
+        db.execute("DELETE FROM documents")
+        db.commit()
+        db.execute("VACUUM")
+    print(f"index: {len(rows)} citations in {args.buckets} buckets, from {n_docs} listed documents")
+    print("year  with_document  no_document")
+    for r in db.execute("""SELECT substr(violation_date,1,4) y, SUM(doc_link_uuid IS NOT NULL) a,
+                                  SUM(doc_link_uuid IS NULL) b FROM citations GROUP BY 1 ORDER BY 1"""):
+        print(f"{r['y']}  {r['a']:>13}  {r['b']:>11}")
+    r = db.execute("SELECT COUNT(*) n, MIN(day) a, MAX(day) b FROM listed_days").fetchone()
+    print(f"document filing days listed: {r['n']} ({r['a']} .. {r['b']})")
+
+
+def cmd_missing_days(args):
+    """Completeness check for the index build: 0 means every day is searched and every filing day listed."""
+    db = connect(args.data_dir)
+    missing = len(shard_days(db, args, "searched_days"))
+    args.date_to = args.docs_to
+    print(missing + len(shard_days(db, args, "listed_days")))
+
+
+def cmd_take_bucket(args):
+    """Start (or resume) one bucket: copy its citations from the index into this data dir's database."""
+    db = connect(args.data_dir)
+    db.execute("ATTACH DATABASE ? AS idx", (args.index,))
+    mine = {r[0] for r in db.execute("SELECT citation_number FROM citations")}
+    if mine:
+        theirs = {r[0] for r in db.execute("SELECT citation_number FROM idx.citations WHERE bucket=?", (args.bucket,))}
+        if mine == theirs:
+            print(f"bucket database already has {len(mine)} citations; resuming")
+            return
+        # partial work left over from a different index (the buckets were cut differently): start clean
+        print(f"existing database doesn't match bucket {args.bucket} of this index; starting the bucket over")
+        db.execute("DELETE FROM citations")
+        db.execute("DELETE FROM latency_log")
+    cols = ", ".join(r[1] for r in db.execute("PRAGMA idx.table_info(citations)"))
+    n = db.execute(f"INSERT INTO citations ({cols}) SELECT {cols} FROM idx.citations WHERE bucket=?",
+                   (args.bucket,)).rowcount
+    db.execute("INSERT OR REPLACE INTO meta VALUES ('bucket', ?)", (str(args.bucket),))
+    db.commit()
+    todo = db.execute("SELECT COUNT(*) FROM citations WHERE status='new'").fetchone()[0]
+    print(f"bucket {args.bucket}: {n} citations, {todo} to fetch")
+
+
+def cmd_remaining(args):
+    """Print how much work is left: citations not yet fetched/OCR'd, plus (with --from/--to) this shard's
+    unsearched days."""
+    db = connect(args.data_dir)
+    days_left = 0
+    if args.date_from and args.date_to:
+        k, n = args.shard
+        d, end = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to)
+        searched = {r[0] for r in db.execute("SELECT day FROM searched_days")}
+        days = (d + timedelta(i) for i in range((end - d).days + 1))
+        days_left = sum(1 for x in days if x.toordinal() % n == k and x.isoformat() not in searched)
     todo = db.execute("SELECT COUNT(*) FROM citations WHERE status IN ('new', 'fetched')").fetchone()[0]
     print(days_left + todo)
 
@@ -833,7 +1043,9 @@ def main():
 
     s = sub.add_parser("fetch")
     s.add_argument("--limit", type=int)
-    s.add_argument("--retry", action="store_true", help="also retry error and no_doc rows")
+    s.add_argument("--retry", action="store_true",
+                   help="also retry error and no_doc rows (no_doc rows are looked up case by case: 2 requests each)")
+    s.add_argument("--retry-errors", action="store_true", help="also retry error rows")
     s.add_argument("--with-charges", action="store_true", help="also pull classification and disposition (+2 requests each)")
     s.add_argument("--workers", type=int, default=16,
                    help="parallel downloads; total request rate is still capped by --interval (default 16)")
@@ -867,10 +1079,33 @@ def main():
     s.add_argument("--max-minutes", type=float, help="give up waiting after this long (for CI time limits)")
     s.set_defaults(func=cmd_wait_maintenance)
 
-    s = sub.add_parser("remaining",help="print the amount of work left for this shard (0 = done)")
-    s.add_argument("--from", dest="date_from", required=True)
-    s.add_argument("--to", dest="date_to", required=True)
+    s = sub.add_parser("remaining", help="print the amount of work left (0 = done)")
+    s.add_argument("--from", dest="date_from", help="with --to: also count this shard's unsearched days")
+    s.add_argument("--to", dest="date_to")
     s.set_defaults(func=cmd_remaining)
+
+    s = sub.add_parser("list-docs", help="list every parking-citation document by filing day")
+    s.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD (docket entry filed date)")
+    s.add_argument("--to", dest="date_to", required=True, help="YYYY-MM-DD inclusive")
+    s.add_argument("--redo", action="store_true")
+    s.add_argument("--workers", type=int, default=4)
+    s.set_defaults(func=cmd_list_docs)
+
+    s = sub.add_parser("build-index", help="join citations to their documents and assign buckets")
+    s.add_argument("--buckets", type=int, default=256)
+    s.add_argument("--slim", action="store_true", help="drop the document list afterwards to shrink the index")
+    s.set_defaults(func=cmd_build_index)
+
+    s = sub.add_parser("missing-days", help="print how many of this shard's days are not searched / not listed yet")
+    s.add_argument("--from", dest="date_from", required=True)
+    s.add_argument("--to", dest="date_to", required=True, help="last violation day to search")
+    s.add_argument("--docs-to", required=True, help="last filing day to list")
+    s.set_defaults(func=cmd_missing_days, redo=False)
+
+    s = sub.add_parser("take-bucket", help="copy one bucket's citations from the index into --data-dir")
+    s.add_argument("--index", required=True, help="path to the index parking.db")
+    s.add_argument("--bucket", type=int, required=True)
+    s.set_defaults(func=cmd_take_bucket)
 
     s = sub.add_parser("backup",help="copy the database somewhere safe (e.g. OneDrive) while running")
     s.add_argument("--to", required=True, help="destination .db file")

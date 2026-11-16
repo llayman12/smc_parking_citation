@@ -835,43 +835,58 @@ def cmd_geocode(args):
         """SELECT DISTINCT infraction_location FROM citations
            WHERE infraction_location IS NOT NULL
              AND infraction_location NOT IN (SELECT location FROM geocodes)""")]
-    print(f"{len(locs)} unique locations to geocode")
-    for start in range(0, len(locs), args.batch):
-        if args.stop_at and time.time() >= args.stop_at:  # Census geocoder: court outages don't apply
-            print("stopped at --stop-at deadline; rerun to continue")
-            break
-        chunk = locs[start:start + args.batch]
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        for i, loc in enumerate(chunk):
-            w.writerow([i, loc, "Seattle", "WA", ""])
-        for attempt in range(4):
-            try:
-                r = requests.post(CENSUS_BATCH, files={"addressFile": ("a.csv", buf.getvalue(), "text/csv")},
-                                  data={"benchmark": "Public_AR_Current", "vintage": "Current_Current"}, timeout=300)
-                r.raise_for_status()
+    print(f"{len(locs)} unique locations to geocode ({args.geo_workers} requests at a time)")
+    chunks = [locs[s:s + args.batch] for s in range(0, len(locs), args.batch)]
+    done = 0
+    # the Census requests run in parallel threads; all database writes stay on this thread
+    with ThreadPoolExecutor(max_workers=max(1, args.geo_workers)) as pool:
+        for chunk, text in pool.map(lambda ch: (ch, census_batch(ch, args)), chunks):
+            if text is None:
+                print("stopped at --stop-at deadline; rerun to continue")
                 break
-            except requests.RequestException as e:
-                if attempt == 3:
-                    raise
-                print(f"  ! Census geocoder: {e}; retrying in {30 * (attempt + 1)}s", file=sys.stderr)
-                time.sleep(30 * (attempt + 1))
-        for rec in csv.reader(io.StringIO(r.text)):
-            if not rec or not rec[0].isdigit():
-                continue
-            loc = chunk[int(rec[0])]
-            rec += [""] * (12 - len(rec))
-            lon = lat = None
-            if rec[5]:
-                lon, lat = (float(x) for x in rec[5].split(","))
-            st, co, tr, bl = rec[8], rec[9], rec[10], rec[11]
-            db.execute("INSERT OR REPLACE INTO geocodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                       (loc, rec[2], rec[3], rec[4], lon, lat, st, co, tr, bl,
-                        (st + co + tr) if tr else None))
-        db.commit()
-        print(f"  geocoded {min(start + args.batch, len(locs))}/{len(locs)}")
+            store_geocodes(db, chunk, text)
+            done += len(chunk)
+            print(f"  geocoded {done}/{len(locs)}")
     for row in db.execute("SELECT match, COUNT(*) n FROM geocodes GROUP BY match"):
         print(f"  {row['match']}: {row['n']}")
+
+
+def census_batch(chunk, args):
+    """POST one batch to the Census geocoder; returns its CSV text (None if past --stop-at)."""
+    if args.stop_at and time.time() >= args.stop_at:  # Census geocoder: court outages don't apply
+        return None
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    for i, loc in enumerate(chunk):
+        w.writerow([i, loc, "Seattle", "WA", ""])
+    for attempt in range(4):
+        try:
+            r = requests.post(CENSUS_BATCH, files={"addressFile": ("a.csv", buf.getvalue(), "text/csv")},
+                              data={"benchmark": "Public_AR_Current", "vintage": "Current_Current"}, timeout=300)
+            r.raise_for_status()
+            break
+        except requests.RequestException as e:
+            if attempt == 3:
+                raise
+            print(f"  ! Census geocoder: {e}; retrying in {30 * (attempt + 1)}s", file=sys.stderr)
+            time.sleep(30 * (attempt + 1))
+    return r.text
+
+
+def store_geocodes(db, chunk, text):
+    for rec in csv.reader(io.StringIO(text)):
+        if not rec or not rec[0].isdigit():
+            continue
+        loc = chunk[int(rec[0])]
+        rec += [""] * (12 - len(rec))
+        lon = lat = None
+        if rec[5]:
+            lon, lat = (float(x) for x in rec[5].split(","))
+        st, co, tr, bl = rec[8], rec[9], rec[10], rec[11]
+        db.execute("INSERT OR REPLACE INTO geocodes VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                   (loc, rec[2], rec[3], rec[4], lon, lat, st, co, tr, bl,
+                    (st + co + tr) if tr else None))
+    db.commit()
 
 
 # ---------------------------------------------------------------- export / status
@@ -1079,6 +1094,7 @@ def main():
 
     s = sub.add_parser("geocode")
     s.add_argument("--batch", type=int, default=1000, help="addresses per Census request (max 10000)")
+    s.add_argument("--geo-workers", type=int, default=2, help="Census batch requests in flight at once")
     s.set_defaults(func=cmd_geocode)
 
     s = sub.add_parser("export")

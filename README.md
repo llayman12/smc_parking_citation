@@ -75,6 +75,7 @@ Every stage is resumable: rerunning skips days already searched and tickets alre
 | `.github/workflows/daily.yml` | Every day: the citations created since the last run, downloaded and OCR'd by one job. |
 | `state/daily_state.tsv` | The daily run's memory (where the next window starts, recent tickets, tickets waiting for a document). Committed by the workflow. |
 | `sync_results.ps1` | Pulls finished bucket and daily databases and ticket images from GitHub to the PC and OneDrive; optionally merges, geocodes and exports. |
+| `daily_sync.ps1` | Run by the Windows scheduled task `SMC daily sync` at 7:00 AM: `sync_results.ps1 -Merge` with a log in `C:\SMCData\logs`. |
 | `requirements.txt` | `requests`, `pypdf`, `pillow`, `pytesseract`. |
 | `archive/` | Earlier prototype scripts and scrapes. Local only (git-ignored). |
 

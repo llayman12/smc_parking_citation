@@ -1,7 +1,7 @@
 # smc_parking_citation
 
-Collects every Seattle Municipal Court (SMC) **parking citation** from January 2020 through October 2026 from
-the court's public records API, reads the **infraction location** off each ticket image with OCR, and
+Collects every Seattle Municipal Court (SMC) **parking citation** from January 2020 onward from the court's
+public records API (the full extraction covered through October 2026; a daily run keeps it current), reads the **infraction location** off each ticket image with OCR, and
 geocodes it to a **census tract**. The goal is to test whether parking enforcement in Seattle differs
 across demographically distinct neighborhoods.
 
@@ -17,21 +17,22 @@ the ticket itself, a PDF attached to each case. So the pipeline downloads one do
 2. [Repository layout](#repository-layout)
 3. [Architecture](#architecture)
 4. [Running it on GitHub Actions](#running-it-on-github-actions)
-5. [Getting the results: sync, merge, export](#getting-the-results-sync-merge-export)
-6. [Ticket images](#ticket-images)
-7. [The data source](#the-data-source)
-8. [Ticket formats](#ticket-formats)
-9. [Database schema](#database-schema)
-10. [Exported CSV](#exported-csv)
-11. [Rate limiting and server courtesy](#rate-limiting-and-server-courtesy)
-12. [API limits: research and observations](#api-limits-research-and-observations)
-13. [Performance](#performance)
-14. [Known data gaps and caveats](#known-data-gaps-and-caveats)
-15. [Notes for the analysis](#notes-for-the-analysis)
-16. [Design history](#design-history)
-17. [Ideas not yet built](#ideas-not-yet-built)
-18. [Command reference](#command-reference)
-19. [Troubleshooting](#troubleshooting)
+5. [Daily updates](#daily-updates)
+6. [Getting the results: sync, merge, export](#getting-the-results-sync-merge-export)
+7. [Ticket images](#ticket-images)
+8. [The data source](#the-data-source)
+9. [Ticket formats](#ticket-formats)
+10. [Database schema](#database-schema)
+11. [Exported CSV](#exported-csv)
+12. [Rate limiting and server courtesy](#rate-limiting-and-server-courtesy)
+13. [API limits: research and observations](#api-limits-research-and-observations)
+14. [Performance](#performance)
+15. [Known data gaps and caveats](#known-data-gaps-and-caveats)
+16. [Notes for the analysis](#notes-for-the-analysis)
+17. [Design history](#design-history)
+18. [Ideas not yet built](#ideas-not-yet-built)
+19. [Command reference](#command-reference)
+20. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -41,6 +42,7 @@ The full collection runs on GitHub Actions:
 
 ```powershell
 gh workflow run index.yml -R llayman12/smc_parking_citation     # build the index, then start the buckets
+gh workflow run daily.yml -R llayman12/smc_parking_citation     # incremental run (also runs every day at 4 AM)
 .\sync_results.ps1 -Merge                                       # any time: pull results, merge, export CSV
 ```
 
@@ -70,7 +72,9 @@ Every stage is resumable: rerunning skips days already searched and tickets alre
 | `parking_pipeline.py` | The whole pipeline: `search`, `list-docs`, `build-index`, `take-bucket`, `fetch`, `ocr`, `geocode`, `export`, plus `merge`, `status`, `remaining` and other helpers. |
 | `.github/workflows/index.yml` | Step 1: builds the index (all citations joined to their ticket documents, split into 256 buckets). |
 | `.github/workflows/buckets.yml` | Step 2: downloads and OCRs the tickets, one bucket per job, several jobs at a time. |
-| `sync_results.ps1` | Pulls finished bucket databases and ticket images from GitHub to the PC and OneDrive; optionally merges, geocodes and exports. |
+| `.github/workflows/daily.yml` | Every day: the citations created since the last run, downloaded and OCR'd by one job. |
+| `state/daily_state.tsv` | The daily run's memory (where the next window starts, recent tickets, tickets waiting for a document). Committed by the workflow. |
+| `sync_results.ps1` | Pulls finished bucket and daily databases and ticket images from GitHub to the PC and OneDrive; optionally merges, geocodes and exports. |
 | `requirements.txt` | `requests`, `pypdf`, `pillow`, `pytesseract`. |
 | `archive/` | Earlier prototype scripts and scrapes. Local only (git-ignored). |
 
@@ -203,6 +207,51 @@ Each bucket job's summary shows its `status` counts.
 
 ---
 
+## Daily updates
+
+`daily.yml` keeps the data current once the full extraction is done. It runs every day at 12:07 UTC (4:07 AM
+Seattle standard time, 5:07 AM in summer), waits out the portal's nightly slow period until 4:30, and is
+normally finished within half an hour. One job, no index or buckets: about 900 parking tickets a day.
+
+**Created date, not violation date.** The citation search accepts `createdDateFrom/To`, the date the court's
+record was created. Searching by it returns every ticket entered on a day, including ones entered long after
+the violation (the slowest 0.1% are filed up to ~300 days late), so nothing is missed by looking back only
+to the previous run. Each run searches from the day before its last window ended (one day of overlap) to today.
+
+**Each run:**
+1. Searches citations created in the window and drops ones a recent run already found (`seen`).
+2. Adds tickets from earlier runs that are still waiting for their document (`pending`).
+3. Lists parking-citation documents filed in the last 8 days and matches them (`build-index`).
+4. Downloads and OCRs the matched tickets (`fetch --ocr`), then retries errors once.
+5. Writes the next state: tickets done are `seen` (kept only while still inside the overlap); everything else
+   (no document yet, errors, unfinished) is `pending` and retried daily for 30 days, after which it is final
+   as `no_doc` or `error`.
+6. Uploads `daily-db-<date>-<run>` (90 days) and `daily-images-<date>-<run>` (30 days), then commits
+   `state/daily_state.tsv`.
+
+**Failures lose nothing.** The state is committed only after the results are uploaded, and a day whose search
+or document listing failed (or was skipped for an outage) holds the window back, so the next run redoes it.
+Rerunning on the same day is safe: artifact names include the run id, and the merge keeps the best copy.
+
+**Keeping it alive.** GitHub disables scheduled workflows in a public repo after 60 days without repository
+activity; the daily state commit counts as activity. If the schedule is ever disabled, GitHub emails a warning,
+and `gh workflow enable daily.yml` turns it back on.
+
+**Starting over.** `daily-seed` builds the state file from a merged database:
+
+```powershell
+python parking_pipeline.py --data-dir C:\SMCData\all daily-seed --last-day 2026-11-01 --seen-from 2026-10-01 --pending-from 2026-10-20
+```
+
+The state file was seeded this way on 2026-11-20: the first window began with records created on Oct 31,
+tickets with October violations already collected were marked seen, and October tickets without a document
+became pending.
+
+**On the PC**, a Windows scheduled task (`SMC daily sync`, 7:00 AM) runs `sync_results.ps1 -Merge`, so the
+merged database and the CSV are current every morning.
+
+---
+
 ## Getting the results: sync, merge, export
 
 ```powershell
@@ -215,12 +264,14 @@ Each bucket job's summary shows its `status` counts.
 |---|---|
 | Bucket databases (working copies) | `C:\SMCData\buckets\done-NNN.db` |
 | Bucket databases (compressed copies) | `<OneDrive - UW>\SMCData\db\done-NNN.db.gz` |
-| Ticket images | `<OneDrive - UW>\SMCData\images\images-NNN-<id>.zip` |
+| Daily databases | `C:\SMCData\daily\daily-db-<date>-<run>.db`, compressed copies in `<OneDrive - UW>\SMCData\db` |
+| Ticket images | `<OneDrive - UW>\SMCData\images\images-NNN-<id>.zip` and `daily-images-<date>-<run>-<id>.zip` |
 | Merged database | `C:\SMCData\all\parking.db` |
 | CSV | `C:\SMCData\parking_citations.csv` |
 
 The script skips anything already downloaded, and ignores results older than the current index. `-Merge`
-works on partial results and reports what fraction of the buckets (= what size random sample) it covers.
+applies the buckets first and then the daily runs, oldest first; a later copy of a ticket replaces an earlier
+one, except that an OCR'd ticket is never replaced by an unfinished one.
 Geocoding happens here, once, over the merged set, rather than in every worker.
 
 SQLite working files stay out of OneDrive on purpose: a sync client can corrupt a database that is being written.
@@ -499,8 +550,10 @@ Volume: 279,378 parking citations in 2020; weekdays typically see 1,000–1,600.
 
 ## Notes for the analysis
 
-- **Partial data is usable.** Finished buckets are a uniform random sample. Weight counts by
-  256 / (buckets merged) to estimate totals.
+- **Coverage.** All 256 buckets are merged, so the data is every ticket the portal lists, not a sample.
+  (Partial bucket sets were uniform random samples; weighting by 256 / buckets merged applied then.)
+- **Recent days are incomplete for a while.** A ticket appears when the court creates its record, and its
+  document may follow later; treat roughly the last two weeks as provisional.
 - **Complaint-driven vs patrol-driven.** Public comments such as `CSR COMPLAINT` mark tickets written in
   response to a resident complaint. Those measure resident behaviour as much as enforcement, so analyse them
   separately.
@@ -535,8 +588,8 @@ Volume: 279,378 parking citations in 2020; weekdays typically see 1,000–1,600.
   interval by time of day.
 - **Second geocoder** for the ~2–3% of addresses the Census geocoder misses (King County or Seattle
   address points).
-- **Incremental updates.** For new months, build an index for just that date range and run its buckets; the
-  merge already combines any set of bucket databases. Keep bucket counts small for small ranges.
+- **Disposition refresh.** Dispositions are recorded as of when a ticket was fetched (and only with
+  `--with-charges`). A periodic re-check of recent open cases would keep outcomes current.
 - **Non-GitHub workers.** A PC or server could work buckets too, but it would need a GitHub token to upload
   results and a claim step so two machines don't take the same bucket.
 - **Manual entry tool** for handwritten tickets, working from the saved images.
@@ -563,13 +616,15 @@ Global options (before the subcommand):
 | `take-bucket --index FILE --bucket N` | Copy one bucket's citations into `--data-dir` (or resume it). |
 | `fetch` | `--workers 16`, `--ocr`, `--ocr-workers N`, `--delete-images [printed\|all]`, `--retry-errors`, `--retry`, `--limit N`, `--with-charges` |
 | `ocr` | `--workers N`, `--delete-images [printed\|all]`, `--redo`, `--reparse` (re-parse stored text only) |
-| `geocode` | `--batch 1000` |
+| `geocode` | `--batch 1000`, `--geo-workers 2` (Census requests in flight) |
 | `export` | `--out FILE.csv` |
 | `status` | Counts by status, days searched, top errors. |
 | `remaining` | Tickets not finished (0 = done). With `--from --to`, also this shard's unsearched days. |
 | `merge DB ...` | Combine databases into `--data-dir`. |
 | `backup --to FILE.db` | Consistent copy while running. |
 | `wait-maintenance` | Sleep through an announced portal outage (`--max-minutes` caps the wait). |
+| `daily` | Incremental run from `--state state/daily_state.tsv`. `--workers 12`, `--ocr-workers N`, `--limit N` (testing) |
+| `daily-seed --last-day --seen-from --pending-from` | Create the daily state file from a merged database. |
 
 ---
 

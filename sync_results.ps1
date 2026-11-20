@@ -2,7 +2,7 @@
 # anything already downloaded is skipped. GitHub only holds results temporarily (bucket databases 90 days,
 # ticket images 30 days), so run this at least every couple of weeks while the pipeline is working.
 #
-#   .\sync_results.ps1                 # download new bucket databases and image archives
+#   .\sync_results.ps1                 # download new bucket and daily databases and image archives
 #   .\sync_results.ps1 -Merge          # ...then merge, geocode and export the CSV
 #   .\sync_results.ps1 -NoImages       # databases only
 #
@@ -11,6 +11,8 @@
 #                                                   ~115 GB in total). Marked online-only once written,
 #                                                   so OneDrive uploads them and frees the local disk.
 #   <OneDrive>\SMCData\db\done-NNN.db.gz            compressed copy of each finished bucket database
+#   <OneDrive>\SMCData\db\daily-db-<date>-<run>.db.gz   the same for each daily run (daily.yml)
+#   C:\SMCData\daily\daily-db-<date>-<run>.db       working copies of the daily databases
 #   C:\SMCData\buckets\done-NNN.db                  working copies used for merging (not in OneDrive: a sync
 #                                                   client and a live SQLite file don't mix)
 #   C:\SMCData\all\parking.db, C:\SMCData\parking_citations.csv   with -Merge
@@ -23,9 +25,10 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $buckets = Join-Path $LocalDir "buckets"
+$daily = Join-Path $LocalDir "daily"
 $dbOut = Join-Path $OneDriveDir "db"
 $imgOut = Join-Path $OneDriveDir "images"
-New-Item -ItemType Directory -Force $buckets, $dbOut, $imgOut | Out-Null
+New-Item -ItemType Directory -Force $buckets, $daily, $dbOut, $imgOut | Out-Null
 
 function Get-Artifact([long]$id, [string]$dest) {
     # curl streams the zip straight to disk; written to a temp name first so a half-download is never kept.
@@ -57,16 +60,18 @@ if (-not $index) { Write-Host "no index on GitHub yet"; return }
 $artifacts = @($artifacts | Where-Object { $_.Created -gt $index.Created })
 
 $done = @($artifacts | Where-Object Name -like "done-*")
-$images = @($artifacts | Where-Object Name -like "images-*")
-Write-Host "$($done.Count) of 256 buckets finished on GitHub; $($images.Count) image archives available"
+$dailyDbs = @($artifacts | Where-Object Name -like "daily-db-*")
+$images = @($artifacts | Where-Object { $_.Name -like "images-*" -or $_.Name -like "daily-images-*" })
+Write-Host "$($done.Count) of 256 buckets finished on GitHub; $($dailyDbs.Count) daily runs; $($images.Count) image archives available"
 
 $newDb = 0
-foreach ($a in $done) {
-    $db = Join-Path $buckets "$($a.Name).db"
+foreach ($a in $done + $dailyDbs) {
+    $dir = if ($a.Name -like "daily-*") { $daily } else { $buckets }
+    $db = Join-Path $dir "$($a.Name).db"
     if (Test-Path $db) { continue }
-    $zip = Join-Path $buckets "$($a.Name).zip"
+    $zip = Join-Path $dir "$($a.Name).zip"
     if (-not (Get-Artifact $a.Id $zip)) { continue }
-    $tmp = Join-Path $buckets "$($a.Name).tmp"
+    $tmp = Join-Path $dir "$($a.Name).tmp"
     Expand-Archive -Force $zip $tmp
     Copy-Item -Force (Join-Path $tmp "parking.db.gz") (Join-Path $dbOut "$($a.Name).db.gz")
     python -c "import gzip,shutil,sys; shutil.copyfileobj(gzip.open(sys.argv[1]), open(sys.argv[2],'wb'))" (Join-Path $tmp "parking.db.gz") "$db.partial"
@@ -95,10 +100,14 @@ if ($script:failures) {
 if ($Merge) {
     $script = Join-Path $PSScriptRoot "parking_pipeline.py"
     $all = Join-Path $LocalDir "all"
-    $dbs = @(Get-ChildItem $buckets -Filter "done-*.db" | ForEach-Object FullName)
+    # buckets first, then daily runs oldest first: a later run's copy of a ticket wins (merge never replaces
+    # an OCR'd ticket with an unfinished one)
+    $dbs = @(Get-ChildItem $buckets -Filter "done-*.db" | Sort-Object Name | ForEach-Object FullName)
+    $nb = $dbs.Count
+    $dbs += @(Get-ChildItem $daily -Filter "daily-db-*.db" | Sort-Object Name | ForEach-Object FullName)
     if (-not $dbs) { Write-Host "nothing to merge yet"; return }
     python $script --data-dir $all merge @dbs | Select-Object -Last 8
     python $script --data-dir $all geocode
     python $script --data-dir $all export --out (Join-Path $LocalDir "parking_citations.csv")
-    Write-Host ("merged {0} of 256 buckets = a {1:P0} random sample of all tickets" -f $dbs.Count, ($dbs.Count / 256))
+    Write-Host ("merged {0} of 256 buckets and {1} daily runs" -f $nb, ($dbs.Count - $nb))
 }

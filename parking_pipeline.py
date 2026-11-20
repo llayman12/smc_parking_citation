@@ -319,12 +319,14 @@ def in_sample(citation_number, rate):
 
 
 # ---------------------------------------------------------------- search
-def search_day(c, day, sample):
-    """Network work for one day (runs in a worker thread). Returns (total, rows); raises on failure."""
+def search_day(c, day, sample, field="violationDate"):
+    """Network work for one day (runs in a worker thread). Returns (total, rows); raises on failure.
+    `field` picks the date the day refers to: violationDate (full extraction) or createdDate (when the
+    court's record was created; the daily run uses it, so late-entered tickets are caught on the day they appear)."""
     start = datetime(day.year, day.month, day.day, tzinfo=TZ)
     params = {
-        "violationDateFrom": start.isoformat(timespec="milliseconds"),
-        "violationDateTo": (start + timedelta(days=1) - timedelta(milliseconds=1)).isoformat(timespec="milliseconds"),
+        f"{field}From": start.isoformat(timespec="milliseconds"),
+        f"{field}To": (start + timedelta(days=1) - timedelta(milliseconds=1)).isoformat(timespec="milliseconds"),
         "caseHeader.courtID": COURT,
         "size": 500,
         # the second key breaks ties: many citations share a violation time, and with ties the server's
@@ -923,13 +925,18 @@ def cmd_backup(args):
 
 
 def cmd_merge(args):
-    """Combine shard databases (each covers different days, so rows never collide) into --data-dir."""
+    """Combine bucket and daily databases into --data-dir. Sources are applied in order and a later copy of a
+    citation replaces an earlier one, except that an OCR'd row is never replaced by an unfinished one
+    (a daily run can see a ticket again before its document is listed)."""
     db = connect(args.data_dir)
     for path in args.sources:
         db.execute("ATTACH DATABASE ? AS src", (path,))
         cols = [r[1] for r in db.execute("PRAGMA src.table_info(citations)")]
         sel = ", ".join(cols)
-        db.execute(f"INSERT OR REPLACE INTO citations ({sel}) SELECT {sel} FROM src.citations")
+        upd = ", ".join(f"{x}=excluded.{x}" for x in cols if x != "citation_number")
+        db.execute(f"""INSERT INTO citations ({sel}) SELECT {sel} FROM src.citations WHERE true
+                       ON CONFLICT(citation_number) DO UPDATE SET {upd}
+                       WHERE excluded.status = 'ocr' OR citations.status != 'ocr'""")
         db.execute("INSERT OR REPLACE INTO searched_days SELECT * FROM src.searched_days")
         db.execute("INSERT OR IGNORE INTO geocodes SELECT * FROM src.geocodes")
         have = {r[0] for r in db.execute("SELECT name FROM src.sqlite_master WHERE type='table'")}
@@ -956,6 +963,144 @@ def cmd_wait_maintenance(args):
           flush=True)
     while maintenance_end() and (limit is None or time.time() < limit):
         time.sleep(60)
+
+
+# ---------------------------------------------------------------- daily
+# The daily run's memory between runs is one small text file, state/daily_state.tsv, committed to the repo:
+#   last_day  <date>    the window of the next run starts the day before this (one day of overlap)
+#   seen      <citation> <created day>     found by a recent run: skip if the overlap finds it again
+#   pending   <citation> <case> ... <first seen>   no document yet (or unfinished): retried for PENDING_DAYS
+STATE_COLS = ["citation_number", "case_uuid", "case_number", "violation_date", "filed_date",
+              "closed_at_search", "citing_agency"]
+PENDING_DAYS = 30
+
+
+def load_state(path):
+    st = {"last_day": None, "seen": {}, "pending": {}}
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            f = line.rstrip("\n").split("\t")
+            if f[0] == "last_day":
+                st["last_day"] = f[1]
+            elif f[0] == "seen":
+                st["seen"][f[1]] = f[2]
+            elif f[0] == "pending":
+                st["pending"][f[1]] = (f[1:1 + len(STATE_COLS)], f[1 + len(STATE_COLS)])
+    return st
+
+
+def save_state(path, st):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".partial", "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"last_day\t{st['last_day']}\n")
+        for cn, day in sorted(st["seen"].items()):
+            f.write(f"seen\t{cn}\t{day}\n")
+        for cn, (row, first) in sorted(st["pending"].items()):
+            f.write("pending\t" + "\t".join("" if v is None else str(v) for v in row) + f"\t{first}\n")
+    os.replace(path + ".partial", path)
+
+
+def cmd_daily(args):
+    """One day's incremental run: citations CREATED since the last run (so late-entered tickets are included),
+    plus earlier tickets still waiting for their document; match them to documents listed in the last week;
+    download and OCR. Writes the results to --data-dir and advances the state file."""
+    db, c = connect(args.data_dir), Client(args.interval)
+    st = load_state(args.state)
+    if not st["last_day"]:
+        sys.exit(f"{args.state} has no last_day; seed it first")
+    today = datetime.now(TZ).date()
+    last = date.fromisoformat(st["last_day"])
+    since = last - timedelta(days=1)  # overlap: the last run saw only the start of its final day
+    days = [since + timedelta(i) for i in range((today - since).days + 1)]
+    list_from = last - timedelta(days=7)  # documents can be filed a little before the citation record
+    list_days = [list_from + timedelta(i) for i in range((today - list_from).days + 1)]
+    print(f"daily run {today}: citations created {since} .. {today}, documents filed {list_from} .. {today}")
+
+    # 1. citations created in the window
+    created, searched = {}, set()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for d, fut in bounded(pool, lambda d: search_day(c, d, 1.0, "createdDate"), days, 8, args):
+            try:
+                total, rows = fut.result()
+            except Exception as e:
+                print(f"  {d}: search ERROR {e}", file=sys.stderr)
+                continue
+            searched.add(d)
+            for r in rows:
+                created.setdefault(r[0], (r, d.isoformat()))
+            print(f"  created {d}: {total} citations, {len(rows)} parking")
+    # a day not searched (error, deadline or portal outage) holds the window back so the next run redoes it
+    failed_days = [d for d in days if d not in searched]
+    fresh = {cn: v for cn, v in created.items() if cn not in st["seen"]}
+    stamp = now()
+    db.executemany(f"INSERT OR IGNORE INTO citations ({', '.join(STATE_COLS)}, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                   [(*r, stamp) for r, _ in fresh.values()])
+    db.executemany(f"INSERT OR IGNORE INTO citations ({', '.join(STATE_COLS)}, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                   [(*[v or None for v in row], stamp) for row, _ in st["pending"].values()])
+    db.commit()
+    print(f"{len(created)} parking citations created in the window, {len(fresh)} not seen before; "
+          f"{len(st['pending'])} pending from earlier runs")
+
+    # 2. documents filed in the last week
+    listed = set()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for d, fut in bounded(pool, lambda d: list_docs_day(c, d), list_days, 8, args):
+            try:
+                total, rows = fut.result()
+            except Exception as e:
+                print(f"  {d}: listing ERROR {e}", file=sys.stderr)
+                continue
+            db.executemany("INSERT OR REPLACE INTO documents VALUES (?,?,?,?)", rows)
+            db.execute("INSERT OR REPLACE INTO listed_days VALUES (?,?)", (d.isoformat(), total))
+            db.commit()
+            listed.add(d)
+    failed_days += [d for d in list_days if d not in listed]
+    c.flush_minutes(db, final=True)
+
+    # 3. match, download, OCR (the same code the bucket jobs use)
+    cmd_build_index(argparse.Namespace(data_dir=args.data_dir, buckets=1, slim=False))
+    fetch_args = argparse.Namespace(data_dir=args.data_dir, interval=args.interval, stop_at=args.stop_at,
+                                    limit=args.limit, retry=False, retry_errors=False, with_charges=False,
+                                    workers=args.workers, ocr=True, ocr_workers=args.ocr_workers,
+                                    delete_images=None)
+    cmd_fetch(fetch_args)
+    fetch_args.retry_errors = True
+    cmd_fetch(fetch_args)
+
+    # 4. next state: everything found is either done (seen) or pending, so the window can always move on,
+    #    except past a day whose search or listing failed
+    for cn, (_, day) in created.items():
+        st["seen"].setdefault(cn, day)
+    pending = {}
+    for r in db.execute(f"SELECT {', '.join(STATE_COLS)}, status FROM citations WHERE status != 'ocr'"):
+        cn = r["citation_number"]
+        first = st["pending"][cn][1] if cn in st["pending"] else today.isoformat()
+        if (today - date.fromisoformat(first)).days < PENDING_DAYS:
+            pending[cn] = ([r[k] for k in STATE_COLS], first)
+    st["pending"] = pending
+    st["last_day"] = min([today] + failed_days).isoformat()
+    next_since = date.fromisoformat(st["last_day"]) - timedelta(days=1)
+    st["seen"] = {cn: d for cn, d in st["seen"].items() if d >= next_since.isoformat()}
+    save_state(args.state, st)
+    counts = dict(db.execute("SELECT status, COUNT(*) FROM citations GROUP BY status").fetchall())
+    print(f"daily result: {counts}; {len(pending)} pending; next window starts {next_since}"
+          + (f"; {len(failed_days)} days failed and will be redone" if failed_days else ""))
+
+
+def cmd_daily_seed(args):
+    """Start the daily state from a merged database: the first window begins the day before --last-day;
+    recent tickets are marked seen, and recent no-document tickets become pending."""
+    src = connect(args.data_dir)
+    st = {"last_day": args.last_day, "seen": {}, "pending": {}}
+    since = (date.fromisoformat(args.last_day) - timedelta(days=1)).isoformat()
+    for r in src.execute("SELECT citation_number FROM citations WHERE status='ocr' AND violation_date >= ?",
+                         (args.seen_from,)):
+        st["seen"][r[0]] = since
+    for r in src.execute(f"SELECT {', '.join(STATE_COLS)} FROM citations WHERE status != 'ocr' "
+                         f"AND violation_date >= ?", (args.pending_from,)):
+        st["pending"][r[0]] = (list(r), args.last_day)
+    save_state(args.state, st)
+    print(f"seeded {args.state}: last_day {args.last_day}, {len(st['seen'])} seen, {len(st['pending'])} pending")
 
 
 def cmd_build_index(args):
@@ -1118,6 +1263,20 @@ def main():
     s.add_argument("--redo", action="store_true")
     s.add_argument("--workers", type=int, default=4)
     s.set_defaults(func=cmd_list_docs)
+
+    s = sub.add_parser("daily", help="incremental run: citations created since the last run (see daily.yml)")
+    s.add_argument("--state", default="state/daily_state.tsv")
+    s.add_argument("--workers", type=int, default=12)
+    s.add_argument("--ocr-workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    s.add_argument("--limit", type=int, help="fetch at most this many tickets (testing; the rest stay pending)")
+    s.set_defaults(func=cmd_daily)
+
+    s = sub.add_parser("daily-seed", help="create the daily state file from a merged database")
+    s.add_argument("--state", default="state/daily_state.tsv")
+    s.add_argument("--last-day", required=True, help="the first daily window starts the day before this")
+    s.add_argument("--seen-from", required=True, help="tickets with violations from this date are marked seen")
+    s.add_argument("--pending-from", required=True, help="no-document tickets from this date become pending")
+    s.set_defaults(func=cmd_daily_seed)
 
     s = sub.add_parser("build-index", help="join citations to their documents and assign buckets")
     s.add_argument("--buckets", type=int, default=256)

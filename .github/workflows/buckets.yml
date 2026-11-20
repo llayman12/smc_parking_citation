@@ -85,7 +85,7 @@ jobs:
       max-parallel: ${{ fromJSON(inputs.workers || '4') }}
       matrix:
         bucket: ${{ fromJSON(needs.plan.outputs.buckets) }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned: the cached Tesseract packages below are built for this release
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -103,9 +103,12 @@ jobs:
 
       - name: Install Tesseract and Python packages
         run: |
-          if ls ~/tesseract-debs/*.deb >/dev/null 2>&1; then
-            sudo dpkg -i ~/tesseract-debs/*.deb
+          # cached packages first; if they don't fit this image (e.g. a new Ubuntu release), install normally
+          if ls ~/tesseract-debs/*.deb >/dev/null 2>&1 && sudo dpkg -i ~/tesseract-debs/*.deb; then
+            echo "installed Tesseract from the cache"
           else
+            sudo dpkg -r tesseract-ocr >/dev/null 2>&1 || true
+            rm -rf ~/tesseract-debs
             for attempt in 1 2 3 4 5; do
               sudo apt-get update -q -o Acquire::Retries=3 && \
               sudo apt-get install -y -q -o Acquire::Retries=5 --download-only tesseract-ocr && break
